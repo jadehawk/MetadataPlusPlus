@@ -175,6 +175,8 @@ Amazon may temporarily rate-limit requests if large libraries are scanned repeat
 
 Use responsibly.
 
+This project represents something special to me. I am not a software developer—I work in a completely different field. Thanks to curiosity, persistence, and modern AI tools, I was able to turn an idea into a working Calibre plugin. If it saves you some time or improves your ebook library, then it has already achieved its purpose.
+
 ---
 
 # License
