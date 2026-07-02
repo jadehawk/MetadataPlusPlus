@@ -149,7 +149,7 @@ Special thanks to:
 
 - kovidgoyal for creating Calibre.
 - MobileRead contributors.
-- Metadata+ author (@jadehawk) for inspiration and valuable technical advice.
+- Metadata+ author @jadehawk (https://github.com/jadehawk) for inspiration and valuable technical advice.
 
 Without those resources this project would not exist.
 
