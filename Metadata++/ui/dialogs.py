@@ -96,6 +96,10 @@ class FetchWorker(QThread):
 
     def run(self):
         from calibre_plugins.metadata_plus.engine.fetch_engine import fetch_for_book  # type: ignore
+        try:
+            from calibre_plugins.metadata_plus.providers.browser_fetch import browser_close  # type: ignore
+        except Exception:
+            browser_close = None
 
         # Install our GUI handler onto the plugin logger for the duration
         # of this worker's run so every log.* call inside fetch_engine
@@ -187,6 +191,12 @@ class FetchWorker(QThread):
         )
 
         # Remove our handler so it doesn't accumulate on reruns
+        if browser_close is not None:
+            try:
+                browser_close()
+            except Exception:
+                pass
+
         plugin_log.removeHandler(gui_handler)
         self.finished.emit()
 
@@ -1269,6 +1279,11 @@ class MetadataFetchDialog(QDialog):
             # one provider timeout; we don't block the UI because abort()
             # makes the worker skip all remaining books immediately.
             self.worker.wait(25000)
+        try:
+            from calibre_plugins.metadata_plus.providers.browser_fetch import browser_close  # type: ignore
+            browser_close()
+        except Exception:
+            pass
         self.reject()
 
 

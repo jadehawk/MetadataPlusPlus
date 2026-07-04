@@ -1,3 +1,10 @@
+Firefox worker cleanup after metadata runs — v6.2.35
+New in v6.2.35:
+  - BUG FIX: Close the reusable Playwright/Firefox worker when a metadata
+    fetch run finishes or is canceled, instead of leaving the visible Firefox
+    window open until Calibre/plugin shutdown. The worker is still reused
+    during a multi-book run; it is only closed at the run boundary.
+
 Single-window Firefox worker (merged) — v6.2.34
 New in v6.2.34:
   - MERGE: Firefox browser integration now reuses a single persistent
