@@ -49,7 +49,22 @@ def levenshtein(a, b):
 
 
 def similarity(a, b):
-    """Return 0–100 similarity score."""
+    """
+    Return 0–100 similarity score combining Levenshtein character similarity
+    and word-level Jaccard overlap.
+
+    v6.2.20 — BUG FIX: switched word overlap from the old
+    len(intersection)/max(len_a, len_b) formula to proper Jaccard
+    len(intersection)/len(union).  The old formula over-rewarded shared
+    prefixes:
+        "la dama revelada"  →  wa = {la, dama, revelada}
+        "la dama de la reina"  →  wb = {la, dama, de, reina}
+        old: 2/max(3,4) = 50%    new Jaccard: 2/5 = 40%
+    That 10-point difference, averaged with the char similarity, is enough
+    to push the combined score just below the acceptance threshold for the
+    bug case without changing legitimate matches (where intersection is large
+    relative to the union).
+    """
     na, nb = normalize_str(a), normalize_str(b)
     if not na and not nb:
         return 100
@@ -57,13 +72,13 @@ def similarity(a, b):
         return 0
     dist = levenshtein(na, nb)
     max_len = max(len(na), len(nb))
-    ratio = int(round((1 - dist / max_len) * 100))
-    # Boost for word overlap
+    char_sim = int(round((1 - dist / max_len) * 100))
     wa, wb = _words(a), _words(b)
     if wa and wb:
-        overlap = len(wa & wb) / max(len(wa), len(wb))
-        ratio = int(round((ratio + overlap * 100) / 2))
-    return max(0, min(100, ratio))
+        union = wa | wb
+        jaccard = int(round(len(wa & wb) / len(union) * 100)) if union else 0
+        return max(0, min(100, (char_sim + jaccard) // 2))
+    return max(0, min(100, char_sim))
 
 
 def title_matches(t1, t2, threshold=80):
@@ -184,6 +199,22 @@ _SYNOPSIS_JUNK_PATTERNS = [
     r'kindle edition by',
     r'download it once and read it',
     r'note taking and highlighting while reading',
+    # v6.2.28: marketplace/seller-listing snippets. These leak in from
+    # "buy from a reseller" widgets embedded on Goodreads/other book pages
+    # (AbeBooks/Biblio/Alibris-style condition blurbs) and get scraped as
+    # if they were the book's own synopsis — field-confirmed: a Goodreads
+    # page for a Spanish-language book produced a 25-character "synopsis"
+    # reading only "Brand New. Ship worldwide."
+    r'\bbrand new\b',
+    r'ship(s|ping)?\s+worldwide',
+    r'usually ships within',
+    r'ready to ship',
+    r'arrives by\b',
+    r'money[\s-]back guarantee',
+    r'satisfaction guaranteed',
+    r'condition:\s*(new|used|like new|very good|good|acceptable)\b',
+    r'\bbuy it now\b',
+    r'\bin stock\b',
 ]
 _SYNOPSIS_JUNK_RE = re.compile('|'.join(_SYNOPSIS_JUNK_PATTERNS), re.I)
 

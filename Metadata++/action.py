@@ -7,6 +7,12 @@ from qt.core import QToolButton, QMenu  # type: ignore
 from calibre.gui2.actions import InterfaceAction  # type: ignore
 from calibre.gui2 import error_dialog, info_dialog, warning_dialog  # type: ignore
 
+try:
+    from calibre_plugins.metadata_plus.core.i18n import tr  # type: ignore
+except Exception:
+    def tr(key, **kwargs):
+        return key
+
 
 class MetadataPlusAction(InterfaceAction):
 
@@ -32,44 +38,56 @@ class MetadataPlusAction(InterfaceAction):
         # Load icon from the images/ folder inside the ZIP
         icon = get_icons('images/metadata_plus.png')  # type: ignore
         self.qaction.setIcon(icon)
+        self.qaction.setToolTip(tr('action_tooltip'))
 
         # Build the dropdown menu
         self.menu = QMenu(self.gui)
         self.qaction.setMenu(self.menu)
+        self._build_menu()
 
-        self.create_menu_action(
+        # Left-click on the toolbar button triggers fetch
+        self.qaction.triggered.connect(self.fetch_all)
+
+    def _build_menu(self):
+        """Populate the dropdown menu with translated labels (called once,
+        from genesis()). apply_settings() re-texts these same QAction
+        objects afterwards rather than rebuilding them — create_menu_action
+        registers each action's unique_name with calibre's global keyboard-
+        shortcut manager, and calling it twice for the same unique_name
+        risks a duplicate-registration error, so the menu structure itself
+        is only ever built once per session."""
+        self.menu.clear()
+
+        self.act_fetch_all = self.create_menu_action(
             self.menu, 'mp-fetch-all',
-            'Fetch Metadata (All Sources)',
+            tr('menu_fetch_all'),
             icon=None,
             triggered=self.fetch_all,
-            description='Parallel fetch from every enabled source')
+            description=tr('menu_fetch_all_desc'))
 
         self.menu.addSeparator()
 
-        self.create_menu_action(
+        self.act_detect_dupes = self.create_menu_action(
             self.menu, 'mp-detect-dupes',
-            'Detect Duplicates in Selection',
+            tr('menu_detect_dupes'),
             triggered=self.detect_duplicates)
 
-        self.create_menu_action(
+        self.act_repair_isbn = self.create_menu_action(
             self.menu, 'mp-repair-isbn',
-            'Repair / Validate ISBNs',
+            tr('menu_repair_isbn'),
             triggered=self.repair_isbns)
 
-        self.create_menu_action(
+        self.act_clear_cache = self.create_menu_action(
             self.menu, 'mp-clear-cache',
-            'Clear Metadata Cache',
+            tr('menu_clear_cache'),
             triggered=self.clear_cache)
 
         self.menu.addSeparator()
 
-        self.create_menu_action(
+        self.act_configure = self.create_menu_action(
             self.menu, 'mp-configure',
-            'Configure Metadata+…',
+            tr('menu_configure'),
             triggered=self.show_config)
-
-        # Left-click on the toolbar button triggers fetch
-        self.qaction.triggered.connect(self.fetch_all)
 
     def initialization_complete(self):
         pass
@@ -79,8 +97,8 @@ class MetadataPlusAction(InterfaceAction):
     def _selected_ids(self):
         rows = self.gui.library_view.selectionModel().selectedRows()
         if not rows:
-            error_dialog(self.gui, 'Metadata++ — No selection',
-                'Please select one or more books first.', show=True)
+            error_dialog(self.gui, tr('no_selection_title'),
+                tr('no_selection_msg'), show=True)
             return []
         return list(map(self.gui.library_view.model().id, rows))
 
@@ -105,7 +123,7 @@ class MetadataPlusAction(InterfaceAction):
             return
         if len(ids) < 2:
             warning_dialog(self.gui, 'Metadata++',
-                'Select at least 2 books to check for duplicates.', show=True)
+                tr('dupe_min_selection_msg'), show=True)
             return
         from calibre_plugins.metadata_plus.engine.fetch_engine import detect_duplicates_in_library  # type: ignore
         from calibre_plugins.metadata_plus.ui.dialogs import DuplicateDialog  # type: ignore
@@ -141,18 +159,30 @@ class MetadataPlusAction(InterfaceAction):
                 repaired += 1
             else:
                 skipped += 1
-        info_dialog(self.gui, 'Metadata++ — ISBN Repair',
-            '{} ISBN(s) repaired/normalized. {} skipped.'.format(repaired, skipped),
+        info_dialog(self.gui, tr('isbn_repair_dialog_title'),
+            tr('isbn_repair_result_msg', repaired=repaired, skipped=skipped),
             show=True)
         self._refresh_gui()
 
     def clear_cache(self):
         from calibre_plugins.metadata_plus.core.cache import MetadataCache  # type: ignore
         MetadataCache().clear()
-        info_dialog(self.gui, 'Metadata++', 'Cache cleared.', show=True)
+        info_dialog(self.gui, 'Metadata++', tr('cache_cleared_msg'), show=True)
 
     def show_config(self):
         self.interface_action_base_plugin.do_user_config(self.gui)
 
     def apply_settings(self):
-        pass
+        # Called by calibre after the user hits Apply/OK in the plugin's
+        # config dialog. Re-text the already-created menu actions in place
+        # (see _build_menu's docstring for why we don't rebuild them) so a
+        # changed "Interface language" setting is reflected immediately,
+        # without needing to restart calibre.
+        self.qaction.setToolTip(tr('action_tooltip'))
+        if hasattr(self, 'act_fetch_all'):
+            self.act_fetch_all.setText(tr('menu_fetch_all'))
+            self.act_fetch_all.setStatusTip(tr('menu_fetch_all_desc'))
+            self.act_detect_dupes.setText(tr('menu_detect_dupes'))
+            self.act_repair_isbn.setText(tr('menu_repair_isbn'))
+            self.act_clear_cache.setText(tr('menu_clear_cache'))
+            self.act_configure.setText(tr('menu_configure'))

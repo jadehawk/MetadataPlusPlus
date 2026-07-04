@@ -19,6 +19,12 @@ except ImportError:
 
 from calibre.gui2 import error_dialog, info_dialog, question_dialog  # type: ignore
 
+try:
+    from calibre_plugins.metadata_plus.core.i18n import tr  # type: ignore
+except Exception:
+    def tr(key, **kwargs):  # fallback: return the raw key if i18n.py is missing
+        return key
+
 
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
 
@@ -186,9 +192,20 @@ class FetchWorker(QThread):
 
 
 # ── Cover Chooser dialog ─────────────────────────────────────────────────────
+#
+# Mirrors calibre's own built-in "pick the best cover" grid from its identify-
+# metadata dialog: every candidate cover collected from every source is shown
+# as a thumbnail; the user clicks to preview/select or double-clicks to
+# accept immediately. This lets the user override the automatic pick — e.g.
+# when a padded/letterboxed Google Books cover was chosen automatically but
+# a clean full-bleed Amazon cover is available and clearly better.
 
 class _CoverBatchLoader(QThread):
-    one_loaded = pyqtSignal(int, bytes, object, object)
+    """Downloads every candidate cover in parallel and reports back per-item
+    (dimensions + quality flags) so the grid can show useful hints (size,
+    ⚠ padded, ⚠ blank) without blocking the UI thread."""
+
+    one_loaded = pyqtSignal(int, bytes, object, object)  # index, data, dims, flags
 
     def __init__(self, candidates, parent=None):
         QThread.__init__(self, parent)
@@ -207,6 +224,16 @@ class _CoverBatchLoader(QThread):
         def _one(index, cand):
             if self._abort:
                 return
+            # v6.2.28: a candidate representing calibre's own current cover
+            # for this book carries its bytes directly (local_data) rather
+            # than a URL — there's nothing to download, and it obviously
+            # isn't a network placeholder, so skip straight to measuring it.
+            if cand.get('local_data'):
+                data = cand['local_data']
+                dims = measure_image_bytes(data) if data else (0, 0)
+                if not self._abort:
+                    self.one_loaded.emit(index, data, dims, {})
+                return
             data = fetch_cover_bytes(cand.get('url', ''), timeout=15)
             dims = measure_image_bytes(data) if data else (0, 0)
             flags = {}
@@ -216,7 +243,7 @@ class _CoverBatchLoader(QThread):
                 except Exception:
                     pass
                 try:
-                    flags['blank'] = is_blank_or_placeholder_image(data)
+                    flags['blank'] = is_blank_or_placeholder_image(data, url=cand.get('url', ''))
                 except Exception:
                     pass
             if not self._abort:
@@ -231,7 +258,9 @@ class _CoverBatchLoader(QThread):
 
 
 class _CoverGridThumb(QFrame):
-    clicked = pyqtSignal()
+    """One clickable thumbnail tile in the Cover Chooser grid."""
+
+    clicked       = pyqtSignal()
     doubleClicked = pyqtSignal()
 
     def __init__(self, candidate, parent=None):
@@ -244,7 +273,7 @@ class _CoverGridThumb(QFrame):
 
         v = QVBoxLayout(self)
         v.setContentsMargins(6, 6, 6, 6)
-        self.img_lbl = QLabel('Loading…')
+        self.img_lbl = QLabel(tr('loading'))
         self.img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.img_lbl.setFixedSize(154, 200)
         v.addWidget(self.img_lbl)
@@ -253,12 +282,14 @@ class _CoverGridThumb(QFrame):
         self.info_lbl.setWordWrap(True)
         self.info_lbl.setStyleSheet('font-size: 10px;')
         v.addWidget(self.info_lbl)
+
         self.set_selected(False)
 
     def set_selected(self, selected):
         self.setStyleSheet(
             'QFrame { border: 3px solid #2a82da; background: #223344; }'
-            if selected else 'QFrame { border: 1px solid #777; }'
+            if selected else
+            'QFrame { border: 1px solid #777; }'
         )
 
     def set_pixmap_data(self, data, dims=None, flags=None):
@@ -293,12 +324,24 @@ class _CoverGridThumb(QFrame):
 
 
 class CoverChooserDialog(QDialog):
+    """
+    Modal dialog listing every candidate cover found across all sources for
+    one book, as a grid of thumbnails — the manual equivalent of calibre's
+    own built-in cover picker.
+
+    candidates: list of {'url': str, 'source': str, 'weight': int}
+    current_url: the URL currently selected (pre-highlighted if present)
+
+    After exec() == Accepted: .selected_url and .selected_data (raw bytes,
+    already downloaded) hold the user's choice.
+    """
+
     def __init__(self, candidates, current_url=None, parent=None):
         QDialog.__init__(self, parent)
-        self.setWindowTitle('Metadata++ — Choose Cover')
+        self.setWindowTitle(tr('cover_chooser_title'))
         self.setMinimumSize(760, 560)
-        self.candidates = candidates
-        self.selected_url = current_url
+        self.candidates    = candidates
+        self.selected_url  = current_url
         self.selected_data = b''
         self._tiles = []
         self._loader = None
@@ -308,9 +351,8 @@ class CoverChooserDialog(QDialog):
     def _build_ui(self):
         root = QVBoxLayout(self)
         root.addWidget(QLabel(
-            '<b>{} cover candidate(s) found</b> across all sources. Click a '
-            'cover to preview/select it, or double-click to pick it immediately.'.format(
-                len(self.candidates))))
+            '<b>{}</b>'.format(
+                tr('cover_chooser_instructions', n=len(self.candidates)))))
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -329,19 +371,21 @@ class CoverChooserDialog(QDialog):
 
         btn_row = QHBoxLayout()
         btn_row.addStretch()
-        ok_btn = QPushButton('✔  Use Selected Cover')
+        ok_btn = QPushButton(tr('btn_use_selected_cover'))
         ok_btn.clicked.connect(self._accept_selected)
-        cancel_btn = QPushButton('Cancel')
+        cancel_btn = QPushButton(tr('btn_cancel'))
         cancel_btn.clicked.connect(self.reject)
         btn_row.addWidget(ok_btn)
         btn_row.addWidget(cancel_btn)
         root.addLayout(btn_row)
 
     def _start_loading(self):
+        # Pre-select whichever tile matches the cover currently in use.
         for i, cand in enumerate(self.candidates):
             if cand.get('url') == self.selected_url:
                 self._select(i)
                 break
+
         self._loader = _CoverBatchLoader(self.candidates, self)
         self._loader.one_loaded.connect(self._on_one_loaded)
         self._loader.start()
@@ -349,8 +393,26 @@ class CoverChooserDialog(QDialog):
     def _on_one_loaded(self, index, data, dims, flags):
         if index >= len(self._tiles):
             return
+        # v6.2.27: hide confirmed blank/placeholder candidates outright
+        # instead of merely annotating them — a small "⚠ blank" caption
+        # underneath a full-size "image not available" thumbnail is easy
+        # to miss, and the whole point of this dialog is to offer only
+        # real choices. If the (now-hidden) tile was the pre-selected
+        # default, fall through to the first still-visible tile instead.
+        if flags and flags.get('blank'):
+            self._tiles[index].setVisible(False)
+            was_selected = (self.candidates[index].get('url') == self.selected_url)
+            if was_selected:
+                self.selected_url  = None
+                self.selected_data = b''
+                for i, tile in enumerate(self._tiles):
+                    if tile.isVisible():
+                        self._select(i)
+                        break
+            return
         self._tiles[index].set_pixmap_data(data, dims, flags)
-        if data and self.candidates[index].get('url') == self.selected_url and not self.selected_data:
+        if (data and self.candidates[index].get('url') == self.selected_url
+                and not self.selected_data):
             self.selected_data = data
 
     def _select(self, index):
@@ -358,7 +420,7 @@ class CoverChooserDialog(QDialog):
             return
         for i, tile in enumerate(self._tiles):
             tile.set_selected(i == index)
-        self.selected_url = self.candidates[index].get('url')
+        self.selected_url  = self.candidates[index].get('url')
         self.selected_data = self._tiles[index].data
 
     def _select_and_accept(self, index):
@@ -367,9 +429,11 @@ class CoverChooserDialog(QDialog):
 
     def _accept_selected(self):
         if not self.selected_url:
-            error_dialog(self, 'Metadata++', 'Please select a cover first.', show=True)
+            error_dialog(self, 'Metadata++', tr('err_select_cover_first'), show=True)
             return
         if not self.selected_data:
+            # Background download for this one hasn't finished yet — fetch
+            # it synchronously rather than making the user wait/retry.
             from calibre_plugins.metadata_plus.providers.providers import fetch_cover_bytes  # type: ignore
             self.selected_data = fetch_cover_bytes(self.selected_url, timeout=15)
         self.accept()
@@ -388,22 +452,37 @@ class CoverChooserDialog(QDialog):
         QDialog.closeEvent(self, ev)
 
 
+# ── Synopsis Chooser dialog ──────────────────────────────────────────────────
+
 class SynopsisChooserDialog(QDialog):
+    """
+    Modal dialog listing every candidate description/synopsis found across
+    all sources for one book — the synopsis equivalent of CoverChooserDialog
+    above, mirroring calibre's own multi-source metadata comparison UI.
+
+    candidates: list of {'text': str, 'source': str, 'lang': str,
+                          'score': float, 'weight': int}
+    current_text: the text currently selected (pre-highlighted if present)
+
+    After exec() == Accepted: .selected_text holds the user's choice.
+    """
+
     def __init__(self, candidates, current_text=None, parent=None):
         QDialog.__init__(self, parent)
-        self.setWindowTitle('Metadata++ — Choose Description')
+        self.setWindowTitle(tr('description_chooser_title'))
         self.setMinimumSize(780, 480)
-        self.candidates = candidates
+        self.candidates    = candidates
         self.selected_text = current_text
         self._build_ui()
 
     def _build_ui(self):
         root = QVBoxLayout(self)
         root.addWidget(QLabel(
-            '<b>{} description(s) found</b> across all sources. Select one '
-            'on the left to preview it, then click Use Selected.'.format(len(self.candidates))))
+            '<b>{}</b>'.format(
+                tr('description_chooser_instructions', n=len(self.candidates)))))
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
+
         self.list = QListWidget()
         self.list.setMinimumWidth(240)
         start_row = 0
@@ -423,13 +502,14 @@ class SynopsisChooserDialog(QDialog):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         root.addWidget(splitter, 1)
+
         self.list.currentRowChanged.connect(self._on_row_changed)
 
         btn_row = QHBoxLayout()
         btn_row.addStretch()
-        ok_btn = QPushButton('✔  Use Selected Description')
+        ok_btn = QPushButton(tr('btn_use_selected_description'))
         ok_btn.clicked.connect(self._accept_selected)
-        cancel_btn = QPushButton('Cancel')
+        cancel_btn = QPushButton(tr('btn_cancel'))
         cancel_btn.clicked.connect(self.reject)
         btn_row.addWidget(ok_btn)
         btn_row.addWidget(cancel_btn)
@@ -443,11 +523,11 @@ class SynopsisChooserDialog(QDialog):
             self.preview.setPlainText('')
             return
         cand = self.candidates[row]
-        header = '<b>Source:</b> {}'.format(cand.get('source', '?'))
+        header = '<b>{}:</b> {}'.format(tr('lbl_source'), cand.get('source', '?'))
         if cand.get('lang'):
-            header += '&nbsp;&nbsp;<b>Language:</b> {}'.format(cand['lang'])
+            header += '&nbsp;&nbsp;<b>{}:</b> {}'.format(tr('lbl_language'), cand['lang'])
         if cand.get('score') is not None:
-            header += '&nbsp;&nbsp;<b>Score:</b> {:.1f}'.format(cand['score'])
+            header += '&nbsp;&nbsp;<b>{}:</b> {:.1f}'.format(tr('lbl_score'), cand['score'])
         body = (cand.get('text', '')
                 .replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
                 .replace('\n', '<br>'))
@@ -456,7 +536,7 @@ class SynopsisChooserDialog(QDialog):
     def _accept_selected(self):
         row = self.list.currentRow()
         if row < 0:
-            error_dialog(self, 'Metadata++', 'Please select a description first.', show=True)
+            error_dialog(self, 'Metadata++', tr('err_select_description_first'), show=True)
             return
         self.selected_text = self.candidates[row].get('text', '')
         self.accept()
@@ -465,30 +545,42 @@ class SynopsisChooserDialog(QDialog):
 # ── Per-book result panel ──────────────────────────────────────────────────────
 
 class BookResultPanel(QGroupBox):
+    # (data_key, i18n string key) — label text is resolved via tr() at
+    # build time (not import time) so it reflects the interface language
+    # currently set in Options even if it's changed without restarting.
     FIELDS = [
-        ('title',       'Title'),
-        ('authors',     'Authors'),
-        ('publisher',   'Publisher'),
-        ('pubdate',     'Pub. Date'),
-        ('comments',    'Description'),
-        ('tags',        'Tags / Categories'),
-        ('rating',      'Rating'),
-        ('language',    'Language'),
-        ('identifiers', 'Identifiers'),
+        ('title',       'field_title'),
+        ('authors',     'field_authors'),
+        ('publisher',   'field_publisher'),
+        ('pubdate',     'field_pubdate'),
+        ('comments',    'field_description'),
+        ('tags',        'field_tags'),
+        ('rating',      'field_rating'),
+        ('language',    'field_language'),
+        ('identifiers', 'field_identifiers'),
     ]
 
-    def __init__(self, book_id, mi, data, parent=None):
+    def __init__(self, book_id, mi, data, parent=None, db=None):
         label = mi.title or 'Book #{}'.format(book_id)
         QGroupBox.__init__(self, label[:80], parent)
         self.book_id    = book_id
         self.mi         = mi
         self.data       = data
+        self.db         = db
         self.checkboxes = {}
-        self.cover_cb = None
+
+        # Cover state — kept separate from `checkboxes`/FIELDS because a
+        # cover isn't a simple mi.<attr> assignment; MetadataFetchDialog._apply()
+        # reads these directly. manual_cover_data is set only when the user
+        # explicitly picks a cover via "Choose Cover…", and always wins.
+        self.cover_cb          = None
         self.selected_cover_url = (data or {}).get('cover_url') or ''
-        self.manual_cover_data = None
+        self.manual_cover_data  = None
         self._cover_thumb_thread = None
+
+        # Description chooser state
         self._comments_val_lbl = None
+
         self._build()
 
     def _build(self):
@@ -502,9 +594,10 @@ class BookResultPanel(QGroupBox):
             return
 
         sources = ', '.join(self.data.get('sources', []))
-        src_lbl = QLabel('<small><b>Sources:</b> {}</small>'.format(sources))
+        src_lbl = QLabel('<small><b>{}:</b> {}</small>'.format(tr('field_sources'), sources))
         layout.addWidget(src_lbl)
 
+        # ── Cover row ─────────────────────────────────────────────────────
         cover_candidates = self.data.get('cover_candidates') or (
             [{'url': self.data['cover_url'], 'source': (self.data.get('sources') or ['?'])[0],
               'weight': 1}]
@@ -517,7 +610,7 @@ class BookResultPanel(QGroupBox):
             self.cover_cb.setChecked(True)
             cover_row.addWidget(self.cover_cb)
 
-            lbl_key = QLabel('<b>Cover</b>')
+            lbl_key = QLabel('<b>{}</b>'.format(tr('field_cover')))
             lbl_key.setFixedWidth(100)
             cover_row.addWidget(lbl_key)
 
@@ -527,14 +620,15 @@ class BookResultPanel(QGroupBox):
             self.cover_thumb.setStyleSheet('border: 1px solid #777;')
             cover_row.addWidget(self.cover_thumb)
 
-            self.cover_source_lbl = QLabel('{} candidate(s) — best: {}'.format(
-                len(cover_candidates), cover_candidates[0].get('source', '?')))
+            self.cover_source_lbl = QLabel(
+                '{} candidate(s) — best: {}'.format(
+                    len(cover_candidates), cover_candidates[0].get('source', '?')))
             self.cover_source_lbl.setWordWrap(True)
             cover_row.addWidget(self.cover_source_lbl, 1)
 
             choose_btn = QPushButton(
-                'Choose Cover… ({})'.format(len(cover_candidates))
-                if len(cover_candidates) > 1 else 'View Cover')
+                tr('choose_cover_button', n=len(cover_candidates))
+                if len(cover_candidates) > 1 else tr('view_cover_button'))
             choose_btn.clicked.connect(self._choose_cover)
             cover_row.addWidget(choose_btn)
 
@@ -545,10 +639,11 @@ class BookResultPanel(QGroupBox):
         grid.setColumnStretch(2, 1)
 
         row = 0
-        for key, label in self.FIELDS:
+        for key, label_key in self.FIELDS:
             val = self.data.get(key)
             if not val:
                 continue
+            label = tr(label_key)
             if isinstance(val, list):
                 display = ', '.join(str(v) for v in val)
             elif isinstance(val, dict):
@@ -572,7 +667,7 @@ class BookResultPanel(QGroupBox):
                 synopsis_candidates = self.data.get('comment_candidates') or []
                 if len(synopsis_candidates) > 1:
                     choose_desc_btn = QPushButton(
-                        'Choose Description… ({})'.format(len(synopsis_candidates)))
+                        tr('choose_description_button', n=len(synopsis_candidates)))
                     choose_desc_btn.clicked.connect(self._choose_description)
                     grid.addWidget(choose_desc_btn, row, 3)
 
@@ -580,6 +675,8 @@ class BookResultPanel(QGroupBox):
             row += 1
 
         layout.addLayout(grid)
+
+    # ── Cover helpers ─────────────────────────────────────────────────────────
 
     def _load_cover_thumb(self, url):
         if not url:
@@ -603,13 +700,56 @@ class BookResultPanel(QGroupBox):
             52, 76, Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation))
 
+    def _get_current_cover_bytes(self):
+        """
+        Return this book's current cover bytes as already stored in
+        calibre, or b'' if it has none. Same dual-path approach as
+        MetadataFetchDialog._current_cover_quality (get_metadata(get_cover=
+        True) first, db.cover() as a fallback for older/newer calibre DB
+        APIs) since that's the version confirmed to work reliably across
+        calibre releases.
+        """
+        if not self.db:
+            return b''
+        try:
+            mi = self.db.get_metadata(self.book_id, index_is_id=True, get_cover=True)
+            if mi.cover_data and len(mi.cover_data) >= 2 and mi.cover_data[1]:
+                return mi.cover_data[1]
+        except Exception:
+            pass
+        try:
+            result = self.db.cover(self.book_id, index_is_id=True)
+            if result is None:
+                return b''
+            if hasattr(result, 'read'):
+                return result.read() or b''
+            if isinstance(result, (bytes, bytearray)):
+                return bytes(result)
+        except Exception:
+            pass
+        return b''
+
     def _choose_cover(self):
-        dlg = CoverChooserDialog(self._cover_candidates, self.selected_cover_url, self)
+        # v6.2.28: offer the book's CURRENT calibre cover as a selectable
+        # candidate too, so "none of the fetched covers are better than
+        # what I already have" is one click away instead of requiring the
+        # user to cancel and leave the existing cover untouched by
+        # unchecking the Cover row entirely.
+        candidates = list(self._cover_candidates)
+        current_data = self._get_current_cover_bytes()
+        if current_data:
+            candidates = [{
+                'url':         'local://current-cover-{}'.format(self.book_id),
+                'source':      tr('current_cover_label'),
+                'weight':      0,
+                'local_data':  current_data,
+            }] + candidates
+        dlg = CoverChooserDialog(candidates, self.selected_cover_url, self)
         if dlg.exec() == QDialog.DialogCode.Accepted and dlg.selected_url:
             self.selected_cover_url = dlg.selected_url
-            self.manual_cover_data = dlg.selected_data or None
-            self.data['cover_url'] = dlg.selected_url
-            src = next((c.get('source', '?') for c in self._cover_candidates
+            self.manual_cover_data  = dlg.selected_data or None
+            self.data['cover_url']  = dlg.selected_url
+            src = next((c.get('source', '?') for c in candidates
                         if c.get('url') == dlg.selected_url), '?')
             self.cover_source_lbl.setText('Manually selected — {}'.format(src))
             if dlg.selected_data:
@@ -621,6 +761,8 @@ class BookResultPanel(QGroupBox):
                         Qt.TransformationMode.SmoothTransformation))
             else:
                 self._load_cover_thumb(dlg.selected_url)
+
+    # ── Description helpers ─────────────────────────────────────────────────
 
     def _choose_description(self):
         candidates = self.data.get('comment_candidates') or []
@@ -655,7 +797,7 @@ class MetadataFetchDialog(QDialog):
         self.ids     = ids
         self._panels = []
         self._errors  = []
-        self.setWindowTitle('Metadata++ — Fetching from all sources')
+        self.setWindowTitle(tr('fetch_dialog_title'))
         self.setMinimumSize(800, 620)
         self._build_ui()
         self._start()
@@ -666,7 +808,7 @@ class MetadataFetchDialog(QDialog):
         root = QVBoxLayout(self)
 
         # Progress bar
-        self.status_lbl = QLabel('Initialising…')
+        self.status_lbl = QLabel(tr('initialising'))
         self.progress   = QProgressBar()
         self.progress.setRange(0, 100)
         root.addWidget(self.status_lbl)
@@ -686,7 +828,7 @@ class MetadataFetchDialog(QDialog):
         self.results_layout.addStretch()
         self.scroll.setWidget(self.container)
         rw_layout.addWidget(self.scroll)
-        self.tabs.addTab(results_widget, 'Results')
+        self.tabs.addTab(results_widget, tr('tab_results'))
 
         # Log tab — dark background for readability
         self.log_view = QTextBrowser()
@@ -700,23 +842,23 @@ class MetadataFetchDialog(QDialog):
         log_widget  = QWidget()
         log_layout  = QVBoxLayout(log_widget)
         log_toolbar = QHBoxLayout()
-        self._log_clear_btn = QPushButton('Clear log')
+        self._log_clear_btn = QPushButton(tr('btn_clear_log'))
         self._log_clear_btn.setFixedWidth(90)
         self._log_clear_btn.clicked.connect(self.log_view.clear)
         log_toolbar.addWidget(self._log_clear_btn)
         log_toolbar.addStretch()
         log_layout.addLayout(log_toolbar)
         log_layout.addWidget(self.log_view)
-        self.tabs.addTab(log_widget, 'Log')
+        self.tabs.addTab(log_widget, tr('tab_log'))
 
         # Buttons
         btn_row = QHBoxLayout()
-        self.sel_all_btn  = QPushButton('Select All')
-        self.desel_btn    = QPushButton('Deselect All')
-        self.apply_btn    = QPushButton('✔  Apply Selected Metadata')
+        self.sel_all_btn  = QPushButton(tr('btn_select_all'))
+        self.desel_btn    = QPushButton(tr('btn_deselect_all'))
+        self.apply_btn    = QPushButton(tr('btn_apply_selected'))
         self.apply_btn.setEnabled(False)
-        self.cancel_btn   = QPushButton('Cancel')
-        self.close_btn    = QPushButton('Close')
+        self.cancel_btn   = QPushButton(tr('btn_cancel'))
+        self.close_btn    = QPushButton(tr('btn_close'))
         self.close_btn.setVisible(False)
 
         btn_row.addWidget(self.sel_all_btn)
@@ -762,7 +904,7 @@ class MetadataFetchDialog(QDialog):
         if last and last.spacerItem():
             self.results_layout.removeItem(last)
 
-        panel = BookResultPanel(book_id, mi, data)
+        panel = BookResultPanel(book_id, mi, data, db=self.db)
         self.results_layout.addWidget(panel)
         self._panels.append(panel)
         self.results_layout.addStretch()
@@ -781,8 +923,8 @@ class MetadataFetchDialog(QDialog):
         self.close_btn.setVisible(True)
         found = sum(1 for p in self._panels if p.data)
         self.status_lbl.setText(
-            'Complete — {}/{} books with metadata. {} error(s).'.format(
-                found, len(self._panels), len(self._errors))
+            tr('status_complete', found=found, total=len(self._panels),
+               errors=len(self._errors))
         )
         # Always show Log tab badge with final counts
         ok  = found
@@ -818,40 +960,113 @@ class MetadataFetchDialog(QDialog):
         """
         Return the (pixels, file_bytes) quality tuple for the book's existing
         cover, or (0, 0) if it has none.
-        Uses calibre's db API to read raw cover bytes directly — no network call.
+
+        ROOT CAUSE OF COVER-REPLACEMENT BUG (fixed here):
+        self.db is gui.current_db which is Calibre's legacy LibraryDatabase2
+        object.  In this API, db.cover(book_id, index_is_id=True, as_file=False)
+        IGNORES the as_file keyword and always returns a file-like object, not
+        bytes.  len() on a file-like object raises TypeError, which the outer
+        try/except caught silently, making this method always return (0, 0).
+        With existing_q = (0, 0), ANY fetched cover with readable pixel
+        dimensions immediately won the comparison — so the plugin replaced
+        a 1205×1500 px / 305 KB existing cover with a tiny Google Books
+        thumbnail on every single run.
+
+        Fix: read cover bytes through get_metadata(get_cover=True) and
+        mi.cover_data, which works identically across all Calibre versions
+        (legacy and new cache DB).  mi.cover_data is a (fmt, bytes) tuple
+        where fmt is a string like 'jpeg' and bytes is the raw image data.
+        Fall back to db.cover() with explicit file-object handling as a
+        secondary path for any edge case where get_metadata doesn't populate
+        cover_data.
         """
         try:
-            from calibre_plugins.metadata_plus.providers.providers import cover_quality, measure_image_bytes  # type: ignore
-            raw = self.db.cover(book_id, index_is_id=True, as_file=False)
-            if raw and len(raw) > 500:
-                return cover_quality(raw)
+            from calibre_plugins.metadata_plus.providers.providers import (  # type: ignore
+                content_cover_quality)
+
+            raw = None
+
+            # Primary path: get_metadata with get_cover=True — works on all
+            # Calibre versions and returns raw bytes in mi.cover_data[1].
+            try:
+                mi = self.db.get_metadata(book_id, index_is_id=True,
+                                          get_cover=True)
+                if mi.cover_data and len(mi.cover_data) >= 2:
+                    raw = mi.cover_data[1]
+            except Exception:
+                raw = None
+
+            # Secondary path: db.cover() — handle both file-object (old API)
+            # and bytes (new API) returns.
+            if not raw:
+                try:
+                    result = self.db.cover(book_id, index_is_id=True)
+                    if result is None:
+                        return (0, 0)
+                    if hasattr(result, 'read'):
+                        raw = result.read()   # file-like object (old API)
+                    elif isinstance(result, (bytes, bytearray)):
+                        raw = bytes(result)   # already bytes (new API)
+                except Exception:
+                    return (0, 0)
+
+            if not raw or len(raw) < 500:
+                return (0, 0)
+
+            q = content_cover_quality(raw)
+            if q[0] > 0:
+                return q
+
+            # Measurement still failed after Pillow fallback inside
+            # measure_image_bytes — use conservative size-based estimate
+            # (2 bytes/pixel lower bound for colour JPEG) so a large
+            # existing cover is never accidentally beaten by a small fetch.
+            return (len(raw) // 2, len(raw))
+
         except Exception:
             pass
         return (0, 0)
 
     def _fetch_best_cover(self, panel):
         """
-        Download the best candidate cover for a book result panel.
+        Download all candidate covers and return the one with the highest
+        quality that is also a clean, trustworthy, full-bleed image (no white
+        border padding, not blank/placeholder).
 
         Strategy
         --------
-        1.  Try the main cover_url first (already chosen by probe_best_cover /
-            best_cover in the fetch engine — highest-quality heuristic winner).
-        2.  If that fails or yields a tiny image, try each cover_alt in order.
-        3.  For every candidate URL, run is_audiobook_cover() before downloading
-            — audiobook covers are skipped entirely without a network call.
-        4.  Return (url, raw_bytes) for the first non-audiobook candidate that
-            downloads to > 5 000 bytes, or (None, b'') if all fail.
+        1. Build candidate list: cover_url first, then all cover_alts.
+        2. Skip audiobook cover URLs (is_audiobook_cover).
+        3. Download each candidate (up to 8 MB).
+        4. Flag a candidate as "untrustworthy" if either:
+             - has_white_border_padding() — white/near-white margins on
+               2+ edges (editorial/marketing image with added whitespace), or
+             - is_blank_or_placeholder_image() — the whole canvas is a flat
+               or near-flat colour / handful of colours (broken thumbnail,
+               "no cover available" tile, generic filler image) — this
+               catches full-canvas blanks that the border-only check above
+               can't see, and non-white placeholder colours.
+           Both cases inflate raw pixel count without representing the
+           actual book cover — a bigger blank image is not a better cover.
+        5. Return the highest cover_quality() candidate among the
+           trustworthy ones.
+        6. If ALL candidates are untrustworthy, fall back to the best one
+           anyway (a bad cover beats no cover at all), but tell the caller
+           via the returned `problematic` flag so it can refuse to let this
+           candidate silently overwrite a perfectly good existing cover.
 
-        This is intentionally separate from the fetch-engine's probe_best_cover
-        so that the actual download happens only at apply-time, not during the
-        parallel metadata fetch (which already HEAD-probed to pick the URL).
+        Returns
+        -------
+        (url, data, problematic) — `problematic` is True when the returned
+        candidate was padded/blank and should only replace an existing
+        cover if the book currently has none.
         """
         from calibre_plugins.metadata_plus.providers.providers import (  # type: ignore
-            fetch_cover_bytes, is_audiobook_cover, cover_quality)
+            fetch_cover_bytes, is_audiobook_cover, cover_quality,
+            has_white_border_padding, is_blank_or_placeholder_image)
 
         if not panel.data:
-            return None, b''
+            return None, b'', False
 
         candidates = []
         main = panel.data.get('cover_url', '')
@@ -861,7 +1076,8 @@ class MetadataFetchDialog(QDialog):
             if alt and alt not in candidates:
                 candidates.append(alt)
 
-        best_url, best_data, best_q = None, b'', (0, 0)
+        clean_best_url,  clean_best_data,  clean_best_q  = None, b'', (0, 0)
+        bad_best_url,    bad_best_data,    bad_best_q    = None, b'', (0, 0)
 
         for url in candidates:
             if is_audiobook_cover(url):
@@ -870,19 +1086,27 @@ class MetadataFetchDialog(QDialog):
             if len(data) < 5000:
                 continue
             q = cover_quality(data)
-            if q > best_q:
-                best_q, best_url, best_data = q, url, data
-            # Stop once we have something reasonably large (> 200 KB / > 400 px²)
-            if best_q[0] > 400 * 400 and best_q[1] > 50_000:
-                break
+            untrustworthy = (has_white_border_padding(data)
+                              or is_blank_or_placeholder_image(data, url=url))
+            if untrustworthy:
+                # Keep as fallback only
+                if q > bad_best_q:
+                    bad_best_q, bad_best_url, bad_best_data = q, url, data
+            else:
+                if q > clean_best_q:
+                    clean_best_q, clean_best_url, clean_best_data = q, url, data
 
-        return best_url, best_data
+        # Prefer a clean, trustworthy cover; fall back to the best bad one
+        # only when nothing clean was found at all.
+        if clean_best_url:
+            return clean_best_url, clean_best_data, False
+        return bad_best_url, bad_best_data, True
 
     # ── Apply ──────────────────────────────────────────────────────────────────
 
     def _apply(self):
         from calibre_plugins.metadata_plus.ui.config import prefs  # type: ignore
-        from calibre_plugins.metadata_plus.providers.providers import cover_quality  # type: ignore
+        from calibre_plugins.metadata_plus.providers.providers import content_cover_quality  # type: ignore
 
         applied = 0
         cover_kept = 0
@@ -893,6 +1117,11 @@ class MetadataFetchDialog(QDialog):
             if not panel.data:
                 continue
 
+            # NOTE: sel can be empty (e.g. the user unchecked every metadata
+            # field because they only wanted to change the cover via
+            # "Choose Cover…") — that must NOT skip the cover logic below,
+            # so we only conditionally touch mi/set_metadata, then always
+            # fall through to the cover section.
             sel = panel.get_selected() or {}
             if sel:
                 mi = self.db.get_metadata(panel.book_id, index_is_id=True)
@@ -920,12 +1149,44 @@ class MetadataFetchDialog(QDialog):
                 self.db.set_metadata(panel.book_id, mi, commit=True)
                 applied += 1
 
+            # ── Cover logic ────────────────────────────────────────────────
+            # Rule 0: the per-book cover checkbox (unchecked = leave this
+            #         book's cover alone entirely, even if auto_cover is on).
+            # Rule 0b: a manually-picked cover (via "Choose Cover…") is the
+            #          user's own explicit judgement call — it is applied
+            #          unconditionally, the same way calibre's own cover
+            #          picker works, bypassing the auto-heuristics below.
+            # Rule 1: otherwise, auto_cover must be enabled.
+            # Rule 2: Download the best non-audiobook candidate cover via
+            #         _fetch_best_cover(), which also flags whether the
+            #         winning candidate is "problematic" — i.e. it has white
+            #         border padding or is a blank/placeholder image (see
+            #         has_white_border_padding() / is_blank_or_placeholder_
+            #         image() in providers.py).
+            # Rule 3a: If the fetched candidate is problematic, it is NOT a
+            #          trustworthy representation of the actual cover, no
+            #          matter how large its raw canvas is — a bigger blank
+            #          or whitespace-padded image is not a better cover.
+            #          Such a candidate is only ever used when the book has
+            #          NO existing cover at all; otherwise the existing
+            #          cover is always kept untouched, regardless of pixel
+            #          counts.
+            # Rule 3b: If the fetched candidate is clean, compare it against
+            #          the existing cover with content_cover_quality() (more
+            #          real content pixels × file bytes wins; ties keep the
+            #          existing cover).
+            # This means a user's hand-picked (or otherwise legitimate)
+            # cover is NEVER silently replaced by a lower-quality, padded,
+            # or blank/placeholder image from the internet.
+
             cover_wanted = panel.cover_cb is None or panel.cover_cb.isChecked()
             if not cover_wanted:
                 cover_skipped += 1
                 continue
 
             if panel.manual_cover_data:
+                # User explicitly picked this cover via "Choose Cover…" —
+                # honour it directly, no heuristic comparison needed.
                 self.db.set_cover(panel.book_id, panel.manual_cover_data)
                 cover_updated += 1
                 continue
@@ -934,14 +1195,26 @@ class MetadataFetchDialog(QDialog):
                 cover_skipped += 1
                 continue
 
-            fetched_url, fetched_data = self._fetch_best_cover(panel)
+            fetched_url, fetched_data, fetched_problematic = \
+                self._fetch_best_cover(panel)
 
             if not fetched_data:
                 cover_skipped += 1
                 continue
 
             existing_q = self._current_cover_quality(panel.book_id)
-            fetched_q  = cover_quality(fetched_data)
+
+            if fetched_problematic:
+                # Padded / blank / placeholder candidate — only acceptable
+                # as a last resort when there's nothing to protect.
+                if existing_q == (0, 0):
+                    self.db.set_cover(panel.book_id, fetched_data)
+                    cover_updated += 1
+                else:
+                    cover_kept += 1
+                continue
+
+            fetched_q = content_cover_quality(fetched_data)
 
             if fetched_q > existing_q:
                 # Fetched cover is strictly better (more pixels, or same

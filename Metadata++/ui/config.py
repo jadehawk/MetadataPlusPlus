@@ -11,6 +11,14 @@ from qt.core import (  # type: ignore
 )
 from calibre.utils.config import JSONConfig  # type: ignore
 
+try:
+    from calibre_plugins.metadata_plus.core.i18n import INTERFACE_LANGUAGES, tr  # type: ignore
+except Exception:
+    INTERFACE_LANGUAGES = [('en', 'English'), ('it', 'Italiano'),
+                            ('es', 'Español'), ('ro', 'Română')]
+    def tr(key, **kwargs):
+        return key
+
 import sys as _sys
 # Suppress console windows spawned by subprocess on Windows.
 # Without this flag every subprocess.run / Popen call opens a
@@ -96,6 +104,7 @@ prefs.defaults.update({
     'normalize_lang':    True,
     'detect_duplicates': True,
     'prefer_language':   'en',
+    'interface_language': 'en',   # v6.2.26 — plugin UI language (en/it/es/ro)
     'log_level':         'INFO',
     # ── Cover quality & ISBN auto-discovery ───────────────────────────────────
     'probe_cover_sizes':       True,
@@ -359,21 +368,21 @@ class _PlaywrightSetupDialog(QDialog):
         layout = QVBoxLayout(self)
 
         # ── Status panel ──────────────────────────────────────────────────────
-        status_grp = QGroupBox('Dependency Status')
+        status_grp = QGroupBox(tr('grp_dependency_status'))
         status_form = QFormLayout(status_grp)
-        self._lbl_python     = QLabel('Checking...')
-        self._lbl_playwright = QLabel('Checking...')
-        self._lbl_firefox    = QLabel('Checking...')
+        self._lbl_python     = QLabel(tr('checking_ellipsis'))
+        self._lbl_playwright = QLabel(tr('checking_ellipsis'))
+        self._lbl_firefox    = QLabel(tr('checking_ellipsis'))
         self._lbl_python.setTextFormat(Qt.TextFormat.RichText)
         self._lbl_playwright.setTextFormat(Qt.TextFormat.RichText)
         self._lbl_firefox.setTextFormat(Qt.TextFormat.RichText)
-        status_form.addRow('System Python:', self._lbl_python)
-        status_form.addRow('Playwright package:', self._lbl_playwright)
-        status_form.addRow('Firefox browser binary:', self._lbl_firefox)
+        status_form.addRow(tr('lbl_system_python'), self._lbl_python)
+        status_form.addRow(tr('lbl_playwright_pkg'), self._lbl_playwright)
+        status_form.addRow(tr('lbl_firefox_binary'), self._lbl_firefox)
         layout.addWidget(status_grp)
 
         # ── Live output area ──────────────────────────────────────────────────
-        layout.addWidget(QLabel('Install output:'))
+        layout.addWidget(QLabel(tr('lbl_install_output')))
         self._output = QPlainTextEdit()
         self._output.setReadOnly(True)
         mono = QFont('Courier New', 9)
@@ -384,20 +393,20 @@ class _PlaywrightSetupDialog(QDialog):
 
         # ── Buttons ───────────────────────────────────────────────────────────
         btn_row = QHBoxLayout()
-        self._btn_install_pw = QPushButton('Install / Reinstall Playwright')
+        self._btn_install_pw = QPushButton(tr('btn_install_playwright'))
         self._btn_install_pw.setToolTip(
             'Runs:  <python> -m pip install --force-reinstall playwright')
         self._btn_install_pw.clicked.connect(self._install_playwright)
 
-        self._btn_install_ff = QPushButton('Install / Reinstall Firefox')
+        self._btn_install_ff = QPushButton(tr('btn_install_firefox'))
         self._btn_install_ff.setToolTip(
             'Runs:  <python> -m playwright install firefox')
         self._btn_install_ff.clicked.connect(self._install_firefox)
 
-        self._btn_recheck = QPushButton('Re-check')
+        self._btn_recheck = QPushButton(tr('btn_recheck'))
         self._btn_recheck.clicked.connect(self._run_check)
 
-        self._btn_close = QPushButton('Close')
+        self._btn_close = QPushButton(tr('btn_close'))
         self._btn_close.clicked.connect(self.accept)
 
         btn_row.addWidget(self._btn_install_pw)
@@ -550,7 +559,7 @@ class ConfigWidget(QWidget):
         src_layout = QVBoxLayout(src_tab)
 
         # ── Global sources ────────────────────────────────────────────────────
-        global_grp = QGroupBox('Global Sources  (always active)')
+        global_grp = QGroupBox(tr('grp_global_sources'))
         global_form = QFormLayout(global_grp)
         self.src_checks = {}
         global_sources = [
@@ -572,10 +581,7 @@ class ConfigWidget(QWidget):
         src_layout.addWidget(global_grp)
 
         # ── Language-specific sources ─────────────────────────────────────────
-        lang_grp = QGroupBox(
-            'Language-Specific Sources\n'
-            '✦ Auto-activated when the book\'s language matches — '
-            'tick to always query regardless of language')
+        lang_grp = QGroupBox(tr('grp_lang_sources'))
         lang_form = QFormLayout(lang_grp)
 
         lang_sources = [
@@ -607,26 +613,26 @@ class ConfigWidget(QWidget):
         src_layout.addWidget(lang_grp)
 
         # ── API Keys ──────────────────────────────────────────────────────────
-        key_grp = QGroupBox('API Keys')
+        key_grp = QGroupBox(tr('grp_api_keys'))
         key_form = QFormLayout(key_grp)
         self.google_api_key = QLineEdit(prefs['google_api_key'])
         self.google_api_key.setPlaceholderText(
             'Optional — raises the Google Books quota well above the shared anonymous limit')
         self.google_api_key.setEchoMode(QLineEdit.EchoMode.Password)
-        key_form.addRow('Google Books API Key:', self.google_api_key)
+        key_form.addRow(tr('lbl_google_api_key'), self.google_api_key)
         self.isbndb_key = QLineEdit(prefs['isbndb_key'])
         self.isbndb_key.setPlaceholderText('Enter ISBNdb API key…')
         self.isbndb_key.setEchoMode(QLineEdit.EchoMode.Password)
-        key_form.addRow('ISBNdb API Key:', self.isbndb_key)
+        key_form.addRow(tr('lbl_isbndb_api_key'), self.isbndb_key)
         src_layout.addWidget(key_grp)
         src_layout.addStretch()
-        tabs.addTab(src_tab, 'Sources')
+        tabs.addTab(src_tab, tr('tab_sources'))
 
         # ── Tab 2: Weights ────────────────────────────────────────────────────
         wt_tab = QWidget()
         wt_layout = QVBoxLayout(wt_tab)
 
-        wt_global_grp = QGroupBox('Global Source Weights  (higher = preferred)')
+        wt_global_grp = QGroupBox(tr('grp_global_weights'))
         wt_global_inner = QVBoxLayout(wt_global_grp)
         self.weight_widgets = {}
         global_weight_sources = [
@@ -646,7 +652,7 @@ class ConfigWidget(QWidget):
             wt_global_inner.addWidget(w)
         wt_layout.addWidget(wt_global_grp)
 
-        wt_lang_grp = QGroupBox('Language-Specific Source Weights')
+        wt_lang_grp = QGroupBox(tr('grp_lang_weights'))
         wt_lang_inner = QVBoxLayout(wt_lang_grp)
         lang_weight_sources = [
             ('weight_casadellibro', '🇪🇸 Casa del Libro'),
@@ -667,13 +673,31 @@ class ConfigWidget(QWidget):
             wt_lang_inner.addWidget(w)
         wt_layout.addWidget(wt_lang_grp)
         wt_layout.addStretch()
-        tabs.addTab(wt_tab, 'Weights')
+        tabs.addTab(wt_tab, tr('tab_weights'))
 
         # ── Tab 3: Options ────────────────────────────────────────────────────
         opt_tab = QWidget()
         opt_layout = QVBoxLayout(opt_tab)
 
-        net_grp = QGroupBox('Network')
+        ui_grp = QGroupBox('Interface')
+        ui_form = QFormLayout(ui_grp)
+        self.combo_ui_lang = QComboBox()
+        for code, name in INTERFACE_LANGUAGES:
+            self.combo_ui_lang.addItem(name, code)
+        idx = self.combo_ui_lang.findData(prefs['interface_language'])
+        if idx >= 0:
+            self.combo_ui_lang.setCurrentIndex(idx)
+        ui_form.addRow(tr('interface_language_label'), self.combo_ui_lang)
+        ui_note = QLabel(
+            'Translates dialog labels and buttons (Fetch/Results, Choose Cover, '
+            'Choose Description, Options). Log output always stays in English '
+            'so it can be pasted into bug reports as-is. Takes effect the next '
+            'time a dialog is opened.')
+        ui_note.setWordWrap(True)
+        ui_form.addRow(ui_note)
+        opt_layout.addWidget(ui_grp)
+
+        net_grp = QGroupBox(tr('grp_network'))
         net_form = QFormLayout(net_grp)
         self.spin_timeout = QSpinBox()
         self.spin_timeout.setRange(5, 120)
@@ -682,17 +706,17 @@ class ConfigWidget(QWidget):
         self.spin_retries = QSpinBox()
         self.spin_retries.setRange(0, 5)
         self.spin_retries.setValue(prefs['retries'])
-        net_form.addRow('Timeout:', self.spin_timeout)
-        net_form.addRow('Retries per source:', self.spin_retries)
+        net_form.addRow(tr('lbl_timeout'), self.spin_timeout)
+        net_form.addRow(tr('lbl_retries'), self.spin_retries)
         opt_layout.addWidget(net_grp)
 
-        meta_grp = QGroupBox('Metadata')
+        meta_grp = QGroupBox(tr('grp_metadata'))
         meta_form = QFormLayout(meta_grp)
-        self.cb_isbn_repair  = QCheckBox('Auto-repair / validate ISBN')
+        self.cb_isbn_repair  = QCheckBox(tr('cb_isbn_repair'))
         self.cb_isbn_repair.setChecked(prefs['auto_isbn_repair'])
-        self.cb_normalize    = QCheckBox('Normalize multilingual metadata')
+        self.cb_normalize    = QCheckBox(tr('cb_normalize'))
         self.cb_normalize.setChecked(prefs['normalize_lang'])
-        self.cb_duplicates   = QCheckBox('Detect duplicates after fetch')
+        self.cb_duplicates   = QCheckBox(tr('cb_duplicates'))
         self.cb_duplicates.setChecked(prefs['detect_duplicates'])
         self.spin_fuzzy = QSpinBox()
         self.spin_fuzzy.setRange(50, 100)
@@ -710,104 +734,96 @@ class ConfigWidget(QWidget):
         meta_form.addRow(self.cb_isbn_repair)
         meta_form.addRow(self.cb_normalize)
         meta_form.addRow(self.cb_duplicates)
-        meta_form.addRow('Fuzzy match threshold:', self.spin_fuzzy)
-        meta_form.addRow('Preferred language:', self.combo_lang)
+        meta_form.addRow(tr('lbl_fuzzy_threshold'), self.spin_fuzzy)
+        meta_form.addRow(tr('lbl_preferred_language'), self.combo_lang)
         opt_layout.addWidget(meta_grp)
 
-        cover_grp = QGroupBox('Cover Art')
+        cover_grp = QGroupBox(tr('grp_cover_art'))
         cover_form = QFormLayout(cover_grp)
-        self.cb_cover = QCheckBox('Auto-download best cover')
+        self.cb_cover = QCheckBox(tr('cb_auto_cover'))
         self.cb_cover.setChecked(prefs['auto_cover'])
         self.spin_cover_min = QSpinBox()
         self.spin_cover_min.setRange(50, 1000)
         self.spin_cover_min.setValue(prefs['cover_min_size'])
         self.spin_cover_min.setSuffix(' px')
-        self.cb_probe_covers = QCheckBox(
-            'Probe cover file sizes (HEAD request) — picks highest-resolution image')
+        self.cb_probe_covers = QCheckBox(tr('cb_probe_covers'))
         self.cb_probe_covers.setChecked(prefs['probe_cover_sizes'])
-        self.cb_probe_ol_cover = QCheckBox(
-            'Direct Open Library cover lookup by ISBN')
+        self.cb_probe_ol_cover = QCheckBox(tr('cb_probe_ol_cover'))
         self.cb_probe_ol_cover.setChecked(prefs['probe_openlibrary_cover'])
         self.spin_probe_timeout = QSpinBox()
         self.spin_probe_timeout.setRange(2, 30)
         self.spin_probe_timeout.setValue(prefs['cover_probe_timeout'])
         self.spin_probe_timeout.setSuffix(' s')
         cover_form.addRow(self.cb_cover)
-        cover_form.addRow('Min cover dimension:', self.spin_cover_min)
+        cover_form.addRow(tr('lbl_min_cover_dim'), self.spin_cover_min)
         cover_form.addRow(self.cb_probe_covers)
         cover_form.addRow(self.cb_probe_ol_cover)
-        cover_form.addRow('Cover probe timeout:', self.spin_probe_timeout)
+        cover_form.addRow(tr('lbl_cover_probe_timeout'), self.spin_probe_timeout)
         opt_layout.addWidget(cover_grp)
 
-        isbn_grp = QGroupBox('ISBN Auto-Discovery')
+        isbn_grp = QGroupBox(tr('grp_isbn_autodiscovery'))
         isbn_form = QFormLayout(isbn_grp)
-        self.cb_isbn_lookup = QCheckBox(
-            'Auto-discover ISBN from ASIN (Amazon dp/ page scrape) when missing')
+        self.cb_isbn_lookup = QCheckBox(tr('cb_isbn_lookup'))
         self.cb_isbn_lookup.setChecked(prefs['auto_isbn_lookup'])
         isbn_form.addRow(self.cb_isbn_lookup)
         opt_layout.addWidget(isbn_grp)
 
-        cache_grp = QGroupBox('Cache')
+        cache_grp = QGroupBox(tr('grp_cache'))
         cache_form = QFormLayout(cache_grp)
         self.spin_cache = QSpinBox()
         self.spin_cache.setRange(0, 90)
         self.spin_cache.setValue(prefs['cache_days'])
         self.spin_cache.setSuffix(' days  (0 = disabled)')
-        cache_form.addRow('Cache TTL:', self.spin_cache)
-        btn_clear = QPushButton('Clear Cache Now')
+        cache_form.addRow(tr('lbl_cache_ttl'), self.spin_cache)
+        btn_clear = QPushButton(tr('btn_clear_cache_now'))
         btn_clear.clicked.connect(self._clear_cache)
         cache_form.addRow(btn_clear)
         opt_layout.addWidget(cache_grp)
 
-        browser_grp = QGroupBox('Browser Fallback (Playwright / Firefox)')
+        browser_grp = QGroupBox(tr('grp_browser_fallback'))
         browser_form = QFormLayout(browser_grp)
-        self.cb_browser_fallback = QCheckBox(
-            'Use Firefox browser as fallback for bot-blocked sources '
-            '(Amazon, Kobo, Casa del Libro, FNAC, Feltrinelli, Libraccio, SBN, Goodreads)')
+        self.cb_browser_fallback = QCheckBox(tr('cb_browser_fallback'))
         self.cb_browser_fallback.setChecked(prefs['use_browser_fallback'])
-        self.cb_browser_headless = QCheckBox(
-            'Run browser headless (no visible Firefox window)')
+        self.cb_browser_headless = QCheckBox(tr('cb_browser_headless'))
         self.cb_browser_headless.setChecked(prefs['browser_headless'])
-        self.cb_amazon_direct_only = QCheckBox(
-            'Amazon: direct lookup only (skip title-search fallback when ASIN/ISBN is known) '
-            '-- prevents multiple browser windows opening for search candidates')
+        self.cb_amazon_direct_only = QCheckBox(tr('cb_amazon_direct_only'))
         self.cb_amazon_direct_only.setChecked(prefs['amazon_direct_only'])
         self.spin_browser_timeout = QSpinBox()
         self.spin_browser_timeout.setRange(10, 120)
         self.spin_browser_timeout.setValue(prefs['browser_timeout'])
         self.spin_browser_timeout.setSuffix(' s')
-        btn_playwright = QPushButton('Check / Install Playwright')
+        btn_playwright = QPushButton(tr('btn_check_install_playwright'))
         btn_playwright.clicked.connect(self._check_playwright)
         browser_form.addRow(self.cb_browser_fallback)
         browser_form.addRow(self.cb_browser_headless)
         browser_form.addRow(self.cb_amazon_direct_only)
-        browser_form.addRow('Browser page timeout:', self.spin_browser_timeout)
+        browser_form.addRow(tr('lbl_browser_page_timeout'), self.spin_browser_timeout)
         browser_form.addRow(btn_playwright)
         opt_layout.addWidget(browser_grp)
 
         opt_layout.addStretch()
-        tabs.addTab(opt_tab, 'Options')
+        tabs.addTab(opt_tab, tr('tab_options'))
 
         # ── Tab 4: Diagnostics ────────────────────────────────────────────────
         diag_tab = QWidget()
         diag_layout = QVBoxLayout(diag_tab)
-        log_grp = QGroupBox('Logging')
+        log_grp = QGroupBox(tr('grp_logging'))
         log_form = QFormLayout(log_grp)
         self.combo_log = QComboBox()
         for lvl in ['DEBUG', 'INFO', 'WARNING', 'ERROR']:
             self.combo_log.addItem(lvl)
         self.combo_log.setCurrentText(prefs['log_level'])
-        log_form.addRow('Log level:', self.combo_log)
+        log_form.addRow(tr('lbl_log_level'), self.combo_log)
         diag_layout.addWidget(log_grp)
 
         self.diag_log = QTextEdit()
         self.diag_log.setReadOnly(True)
-        self.diag_log.setPlaceholderText('Plugin log output appears here…')
+        self.diag_log.setPlaceholderText(tr('placeholder_log_output'))
         self.diag_log.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        diag_layout.addWidget(QLabel('Recent log:'))
+        diag_layout.addWidget(QLabel(tr('lbl_recent_log')))
         diag_layout.addWidget(self.diag_log)
         self._load_log()
-        tabs.addTab(diag_tab, 'Diagnostics')
+        tabs.addTab(diag_tab, tr('tab_diagnostics'))
 
     def _check_playwright(self):
         """Open the Playwright setup dialog (check + auto-install with live output)."""
@@ -846,6 +862,7 @@ class ConfigWidget(QWidget):
         prefs['detect_duplicates']= self.cb_duplicates.isChecked()
         prefs['fuzzy_threshold']  = self.spin_fuzzy.value()
         prefs['prefer_language']  = self.combo_lang.currentData()
+        prefs['interface_language'] = self.combo_ui_lang.currentData()
         prefs['auto_cover']       = self.cb_cover.isChecked()
         prefs['cover_min_size']   = self.spin_cover_min.value()
         prefs['probe_cover_sizes']       = self.cb_probe_covers.isChecked()

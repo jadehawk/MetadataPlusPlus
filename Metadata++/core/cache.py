@@ -11,6 +11,16 @@ import time
 
 from calibre.utils.config import config_dir  # type: ignore
 
+# v6.2.28: bumped whenever a fix changes what a cached "merged" result should
+# contain (e.g. cover/synopsis selection logic). Without this, upgrading the
+# plugin does NOT invalidate previously-cached results — a book fetched
+# before a fix keeps returning the OLD (buggy) cached data for up to
+# cache_days, making a shipped fix look like it "didn't work" even though
+# the new code is installed and correct. Bumping this constant changes every
+# cache key, so old entries are simply never matched/read again (they just
+# age out and get overwritten).
+CACHE_SCHEMA_VERSION = 2
+
 
 class MetadataCache:
     DB_PATH = os.path.join(config_dir, 'metadata_plus_cache.db')
@@ -39,6 +49,7 @@ class MetadataCache:
     @staticmethod
     def _make_key(title, author, isbn, source):
         raw = '|'.join([
+            'v{}'.format(CACHE_SCHEMA_VERSION),
             (title or '').lower().strip(),
             (author or '').lower().strip(),
             (isbn or '').strip(),

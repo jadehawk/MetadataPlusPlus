@@ -207,6 +207,7 @@ import re
 import json
 import time
 import ssl
+import hashlib
 
 try:
     from urllib.request import urlopen, Request
@@ -216,7 +217,8 @@ except ImportError:
     from urllib2 import urlopen, Request, URLError, HTTPError # type: ignore
     from urllib import urlencode, quote_plus # type: ignore
 
-from calibre_plugins.metadata_plus.core.fuzzy import similarity  # type: ignore
+from calibre_plugins.metadata_plus.core.fuzzy import similarity, normalize_str  # type: ignore
+from calibre_plugins.metadata_plus.core.isbn_utils import isbn13_to_10  # type: ignore
 
 # ── Browser fallback (Playwright/Firefox) ─────────────────────────────────────
 # Optional layer that routes bot-blocked requests through a real Firefox
@@ -546,17 +548,109 @@ def _jget(url, timeout=20, retries=2, log=None, headers=None):
 
 
 def _head_content_length(url, timeout=10, log=None):
-    """Return Content-Length in bytes via HEAD, or 0 on failure."""
+    """
+    Return the byte size of the resource at `url`, or 0 on failure.
+
+    v6.2.23: Amazon's image CDN (m.media-amazon.com / images-na.ssl-
+    images-amazon.com) frequently returns 403/empty-body on HEAD requests
+    even though the same URL serves a GET just fine — a known anti-
+    hotlinking behaviour, not a sign the image doesn't exist. Since
+    probe_best_cover() drops any candidate whose probed size comes back
+    as 0, this silently disqualified real, high-resolution Amazon covers
+    (already upgraded to _SL1500_ by _upgrade_amazon_cover) in favour of
+    a lower-resolution Google Books cover that happens to answer HEAD
+    cleanly — exactly the "wrong/lower-quality cover gets applied" bug
+    reported by users whose book already had the correct high-res Amazon
+    art.
+
+    Fix: try HEAD first (cheap, no body download). If it fails or returns
+    no usable Content-Length, fall back to a ranged GET (Range: bytes=0-0)
+    — most CDNs that block HEAD still honour ranged GETs — and read the
+    real size from the Content-Range header. As a last resort, do a plain
+    GET and measure len(data) directly. A Referer header matching the
+    image host's own site is also added, since some CDNs (Amazon's
+    included) use it as a lightweight hotlink check.
+    """
+    def _referer_for(u):
+        lu = u.lower()
+        if 'media-amazon.com' in lu or 'ssl-images-amazon.com' in lu:
+            return 'https://www.amazon.com/'
+        if 'books.google.com' in lu or 'googleusercontent.com' in lu:
+            return 'https://books.google.com/'
+        return None
+
+    headers = {'User-Agent': UA}
+    ref = _referer_for(url)
+    if ref:
+        headers['Referer'] = ref
+
+    # 1. Plain HEAD
     try:
-        req = Request(url, headers={'User-Agent': UA})
+        req = Request(url, headers=headers)
         req.get_method = lambda: 'HEAD'
         resp = urlopen(req, timeout=timeout)
         cl = resp.headers.get('Content-Length', '0')
-        return int(cl) if cl and str(cl).isdigit() else 0
+        n = int(cl) if cl and str(cl).isdigit() else 0
+        if n > 0:
+            return n
     except Exception as e:
         if log:
             log.debug('HEAD failed %s: %s', url[:80], e)
-        return 0
+
+    # 2. Ranged GET — ask for 1 byte, read the real size off Content-Range.
+    #    Many hosts (including Amazon's image CDN) block HEAD but allow this.
+    try:
+        range_headers = dict(headers)
+        range_headers['Range'] = 'bytes=0-0'
+        req = Request(url, headers=range_headers)
+        resp = urlopen(req, timeout=timeout)
+        cr = resp.headers.get('Content-Range', '')  # e.g. 'bytes 0-0/123456'
+        if cr and '/' in cr:
+            total = cr.rsplit('/', 1)[-1].strip()
+            if total.isdigit():
+                return int(total)
+        cl = resp.headers.get('Content-Length', '0')
+        n = int(cl) if cl and str(cl).isdigit() else 0
+        if n > 1:  # a real Content-Length here (not just the 1 ranged byte)
+            return n
+    except Exception as e:
+        if log:
+            log.debug('Ranged GET failed %s: %s', url[:80], e)
+
+    # 3. Last resort — full GET, measure actual bytes downloaded.
+    try:
+        req = Request(url, headers=headers)
+        resp = urlopen(req, timeout=timeout)
+        data = resp.read()
+        if data:
+            return len(data)
+    except Exception as e:
+        if log:
+            log.debug('Fallback GET failed %s: %s', url[:80], e)
+
+    return 0
+
+
+def _http_get_bytes(url, timeout=10, log=None):
+    """
+    Download and return the full response body of `url`, or b'' on
+    failure. Used where we need to actually inspect image content (e.g.
+    Google Books placeholder-hash comparison) rather than just its size.
+    """
+    headers = {'User-Agent': UA}
+    lu = url.lower()
+    if 'media-amazon.com' in lu or 'ssl-images-amazon.com' in lu:
+        headers['Referer'] = 'https://www.amazon.com/'
+    elif 'books.google.com' in lu or 'googleusercontent.com' in lu:
+        headers['Referer'] = 'https://books.google.com/'
+    try:
+        req = Request(url, headers=headers)
+        resp = urlopen(req, timeout=timeout)
+        return resp.read() or b''
+    except Exception as e:
+        if log:
+            log.debug('_http_get_bytes failed %s: %s', url[:80], e)
+        return b''
 
 
 # ── Cover helpers ──────────────────────────────────────────────────────────────
@@ -665,36 +759,58 @@ def measure_image_bytes(data):
     Return (width, height) in pixels from raw image bytes, or (0, 0) on failure.
     Supports PNG, JPEG and WEBP without requiring Pillow — reads the file
     header only, which is always present in the first ~30 bytes.
+
+    BUG FIXED: the original implementation only handled the most common JPEG
+    SOF0/SOF2 markers and would silently return (0, 0) for:
+      - Progressive JPEGs with SOF2 markers preceded by unusual segments
+      - JPEG 2000 / JFIF variants
+      - Images returned by Calibre's db.cover() which may be converted
+        internally and padded differently
+
+    Fix: when the fast header-only parser returns (0, 0), fall back to Pillow
+    (always available inside Calibre's bundled Python environment) for a
+    complete, reliable parse.  The fast path is tried first so the common
+    case has zero overhead; Pillow is only called if the fast path fails.
     """
     if not data or len(data) < 24:
         return (0, 0)
     import struct
+
+    # ── Fast header-only path ─────────────────────────────────────────────
     # PNG: magic 8 bytes, then IHDR chunk (4 len + 4 type + 4W + 4H)
     if data[:8] == b'\x89PNG\r\n\x1a\n':
         try:
             w, h = struct.unpack('>II', data[16:24])
-            return (w, h)
+            if w > 0 and h > 0:
+                return (w, h)
         except Exception:
-            return (0, 0)
-    # JPEG: scan for SOF0/SOF2 markers
+            pass
+
+    # JPEG: scan for SOF0 / SOF1 / SOF2 / SOF3 markers
     if data[:2] == b'\xff\xd8':
         i = 2
         while i < len(data) - 8:
             if data[i] != 0xff:
                 break
             marker = data[i + 1]
-            if marker in (0xC0, 0xC2):  # SOF0, SOF2
+            # SOF0=0xC0  SOF1=0xC1  SOF2=0xC2  SOF3=0xC3 — all contain dimensions
+            if marker in (0xC0, 0xC1, 0xC2, 0xC3):
                 try:
                     h, w = struct.unpack('>HH', data[i + 5:i + 9])
-                    return (w, h)
+                    if w > 0 and h > 0:
+                        return (w, h)
                 except Exception:
                     break
+            # Skip to next segment; 0xD8 (SOI) and 0xD9 (EOI) have no length
+            if marker in (0xD8, 0xD9):
+                i += 2
+                continue
             try:
                 seg_len = struct.unpack('>H', data[i + 2:i + 4])[0]
             except Exception:
                 break
             i += 2 + seg_len
-        return (0, 0)
+
     # WEBP: RIFF....WEBPVP8 / VP8L / VP8X
     if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
         chunk = data[12:16]
@@ -702,17 +818,35 @@ def measure_image_bytes(data):
             try:
                 w = struct.unpack('<H', data[26:28])[0] & 0x3FFF
                 h = struct.unpack('<H', data[28:30])[0] & 0x3FFF
-                return (w + 1, h + 1)
+                if w > 0 and h > 0:
+                    return (w + 1, h + 1)
             except Exception:
-                return (0, 0)
-        if chunk == b'VP8L' and len(data) > 25:
+                pass
+        elif chunk == b'VP8L' and len(data) > 25:
             try:
                 bits = struct.unpack('<I', data[21:25])[0]
                 w = (bits & 0x3FFF) + 1
                 h = ((bits >> 14) & 0x3FFF) + 1
-                return (w, h)
+                if w > 0 and h > 0:
+                    return (w, h)
             except Exception:
-                return (0, 0)
+                pass
+
+    # ── Pillow fallback ───────────────────────────────────────────────────
+    # Reached only when the fast header parser failed.  Pillow is bundled
+    # with Calibre so it's always available inside a plugin; using it here
+    # handles progressive JPEGs, JPEG 2000, GIF, TIFF, BMP, and any other
+    # format the fast path doesn't cover.
+    try:
+        from PIL import Image  # type: ignore  # available in Calibre's Python
+        import io
+        with Image.open(io.BytesIO(data)) as img:
+            w, h = img.size
+            if w > 0 and h > 0:
+                return (w, h)
+    except Exception:
+        pass
+
     return (0, 0)
 
 
@@ -737,7 +871,22 @@ def fetch_cover_bytes(url, timeout=15, log=None):
 def has_white_border_padding(data, border_px=20, white_threshold=240, min_ratio=0.80):
     """
     Return True when a cover image has substantial white/near-white padding
-    on at least 2 of its 4 edges.
+    on at least 2 of its 4 edges — a sign that this is a marketing/editorial
+    image with added whitespace rather than a clean full-bleed book cover.
+
+    Some Amazon and publisher image CDNs deliver the cover art centred on a
+    white background (e.g. Amazon's editorial-image endpoint, some Penguin/
+    Random House jacket files).  These images have higher raw pixel counts
+    than the equivalent full-bleed version, which causes cover_quality() to
+    incorrectly prefer them over the existing library cover even though they
+    are visually inferior (the actual illustration occupies only ~80% of the
+    canvas).
+
+    Detection: sample a strip of `border_px` pixels from each of the 4 edges.
+    If >= 2 edges have >= `min_ratio` of pixels brighter than `white_threshold`
+    on all three RGB channels, the cover is flagged as padded.
+
+    Requires numpy (bundled with Calibre).  Returns False safely on any error.
     """
     try:
         import io as _io
@@ -755,10 +904,10 @@ def has_white_border_padding(data, border_px=20, white_threshold=240, min_ratio=
             return white / (strip.shape[0] * strip.shape[1])
 
         sides = [
-            _white_ratio(arr[:bw, :]),
-            _white_ratio(arr[-bw:, :]),
-            _white_ratio(arr[:, :bw]),
-            _white_ratio(arr[:, -bw:]),
+            _white_ratio(arr[:bw, :]),    # top
+            _white_ratio(arr[-bw:, :]),   # bottom
+            _white_ratio(arr[:, :bw]),    # left
+            _white_ratio(arr[:, -bw:]),   # right
         ]
         padded_sides = sum(1 for r in sides if r >= min_ratio)
         return padded_sides >= 2
@@ -766,11 +915,119 @@ def has_white_border_padding(data, border_px=20, white_threshold=240, min_ratio=
         return False
 
 
-def is_blank_or_placeholder_image(data, std_threshold=10.0, min_unique_colours=6):
+# ── Google Books "no cover available" reference-hash detector (v6.2.28) ────
+# ROOT CAUSE (field-confirmed, twice): Google Books' own volumeInfo.
+# imageLinks sometimes lists a thumbnail URL for a volume that, when
+# actually fetched, serves Google's generic "image not available" tile
+# instead of real art — the API metadata is stale even though the image
+# link itself resolves fine (HTTP 200, plausible byte size). This means
+# checking "does imageLinks exist" (the v6.2.27 fix) is necessary but not
+# sufficient, and the pixel-statistics heuristics in
+# is_blank_or_placeholder_image() below don't reliably catch this specific
+# graphic either (it has just enough anti-aliased text/icon detail to
+# survive std-dev, unique-colour, AND bytes-per-pixel checks).
+#
+# Google's placeholder is a fixed, non-book-specific asset: requesting a
+# books/content cover for ANY nonexistent/coverless volume ID returns the
+# exact same image bytes. So instead of guessing at pixel statistics, we
+# fetch that reference image ONCE per plugin process (a deliberately-bogus
+# ID), hash it, and compare every books.google.com cover download against
+# that hash before trusting it. This is self-updating if Google ever
+# changes the placeholder graphic (each process re-fetches its own
+# reference) and has no false-positive risk against real cover art.
+_google_placeholder_hash = None
+_google_placeholder_lock = None
+
+
+def _get_google_placeholder_hash(timeout=8, log=None):
+    global _google_placeholder_hash, _google_placeholder_lock
+    import threading
+    if _google_placeholder_lock is None:
+        _google_placeholder_lock = threading.Lock()
+    with _google_placeholder_lock:
+        if _google_placeholder_hash is not None:
+            return _google_placeholder_hash
+        try:
+            # A syntactically-valid-looking but essentially-guaranteed-to-
+            # not-exist Google Books volume ID. Google always answers with
+            # its generic placeholder rather than a 404 for this endpoint.
+            bogus_url = ('https://books.google.com/books/content?id='
+                         'zzzzzzzzzzzzzzzzzzzz9999&printsec=frontcover'
+                         '&img=1&zoom=1&source=gbs_api')
+            data = _http_get_bytes(bogus_url, timeout=timeout, log=log)
+            if data and len(data) > 200:
+                _google_placeholder_hash = hashlib.sha256(data).hexdigest()
+                if log:
+                    log.debug('Google placeholder reference hash captured '
+                              '(%d bytes)', len(data))
+            else:
+                _google_placeholder_hash = ''
+        except Exception:
+            _google_placeholder_hash = ''
+        return _google_placeholder_hash
+
+
+def is_google_placeholder_cover(data, url='', timeout=8, log=None):
     """
-    Return True when a cover image is effectively blank / a placeholder.
+    True when `data` is confirmed to be Google Books' "image not available"
+    placeholder graphic (see module comment above). Only meaningful for
+    books.google.com cover URLs; harmless (always False) for anything else.
+    """
+    if not data or not url or 'books.google.com' not in url.lower():
+        return False
+    try:
+        ref = _get_google_placeholder_hash(timeout=timeout, log=log)
+        if not ref:
+            return False
+        return hashlib.sha256(data).hexdigest() == ref
+    except Exception:
+        return False
+
+
+def is_blank_or_placeholder_image(data, std_threshold=10.0, min_unique_colours=6,
+                                   url='', log=None):
+    """
+    Return True when a cover image is effectively blank / a placeholder —
+    a near-uniform flat colour (or two-tone) canvas rather than genuine
+    cover artwork.
+
+    WHY THIS EXISTS: has_white_border_padding() only inspects a thin strip
+    along each of the 4 edges, so it correctly catches a real illustration
+    centred on a white/near-white background. It does NOT catch:
+      - A cover CDN response that is blank/placeholder across its ENTIRE
+        canvas (e.g. a broken Google Books thumbnail, a generic "no cover
+        available" tile, or a solid-colour stock image) — there's no
+        illustrated centre for the border check to contrast against.
+      - Placeholder colours other than white (light grey "unavailable"
+        tiles, flat brand-colour filler images, etc.).
+    These images can still have a large raw pixel canvas (satisfying
+    cover_quality()'s pixel-count comparison) while conveying zero real
+    information about what the book actually looks like — exactly the
+    "truthfulness" problem: a bigger blank image is not a better cover.
+
+    Detection: downsample to a small 32x32 thumbnail (fast, robust to
+    JPEG noise) and check both:
+      1. Overall pixel value standard deviation — real cover art has
+         strong contrast/detail even at 32x32; flat or near-flat images
+         don't.
+      2. Number of visually distinct colours (coarse-bucketed to 4 bits
+         per channel) — a handful of buckets means large flat regions.
+    Either signal alone flags the image as blank/placeholder.
+
+    Requires Pillow + numpy (bundled with Calibre). Returns False safely
+    on any error, and treats undecodable/too-tiny images as blank too
+    (they can't be a trustworthy cover either).
     """
     try:
+        # v6.2.28: check the reliable, self-updating reference-hash signal
+        # FIRST -- see is_google_placeholder_cover()'s docstring for why
+        # this exists (Google's own imageLinks metadata can point at a
+        # coverless volume's placeholder, which survives every pixel-
+        # statistics check below). Only ever matches for books.google.com
+        # URLs; a no-op (and no extra network call) for everything else.
+        if url and is_google_placeholder_cover(data, url=url, log=log):
+            return True
+
         import io as _io
         from PIL import Image as _PIL  # type: ignore
         import numpy as _np
@@ -784,10 +1041,24 @@ def is_blank_or_placeholder_image(data, std_threshold=10.0, min_unique_colours=6
         if arr.std() < std_threshold:
             return True
 
-        buckets = (arr // 16).astype(_np.int32)
+        buckets = (arr // 16).astype(_np.int32)          # 16 buckets/channel
         flat = buckets.reshape(-1, 3)
         unique = len({tuple(row) for row in flat.tolist()})
         if unique < min_unique_colours:
+            return True
+
+        # v6.2.27: THIRD signal — compression efficiency. Real photographed
+        # / illustrated cover art has high pixel-level entropy and does not
+        # compress anywhere near as efficiently as a simple flat-colour
+        # "image not available" / icon+text placeholder tile — even when
+        # that placeholder has just enough anti-aliased text to survive
+        # both checks above (field-confirmed: this is exactly what let
+        # Google Books' own coverless-volume placeholder through). A real
+        # cover JPEG/PNG at typical book-cover resolutions essentially
+        # never compresses below ~0.03 bytes/pixel; simple flat-graphic
+        # placeholders routinely compress to well under that.
+        bytes_per_pixel = len(data) / float(w * h)
+        if bytes_per_pixel < 0.03:
             return True
 
         return False
@@ -800,6 +1071,10 @@ def cover_quality(data):
     Return a quality tuple (pixels, file_bytes) for a raw cover image.
     pixels = width × height (0 if unreadable).
     Higher is better; compare as plain tuples (pixels first, then size).
+
+    Note: this function does NOT penalise white-border padding — the caller
+    (_fetch_best_cover in dialogs.py) uses has_white_border_padding() to
+    filter padded candidates before comparing quality tuples.
     """
     if not data:
         return (0, 0)
@@ -807,10 +1082,65 @@ def cover_quality(data):
     return (w * h, len(data))
 
 
+def content_cover_quality(data):
+    """
+    Like cover_quality(), but padding-aware.
+
+    ROOT CAUSE OF THE "good cover replaced by a padded thumbnail" BUG:
+    cover_quality() intentionally does NOT penalise white-border padding
+    (see its docstring) — that filtering was only ever applied *between*
+    fetched candidates, inside dialogs.py's _fetch_best_cover(). But when
+    every fetched candidate for a book turns out to be padded (e.g. only a
+    letterboxed Google Books/Amazon editorial thumbnail is available),
+    _fetch_best_cover() falls back to returning that padded image anyway
+    (a padded cover beats no cover). The *final* decision of whether to
+    overwrite the book's existing cover then compared raw cover_quality()
+    tuples — and a padded canvas's blank margins inflate its width*height
+    enough to numerically outscore a smaller but full-bleed, higher-quality
+    existing cover, even though the padded image is visually worse.
+
+    Fix: when has_white_border_padding() flags an image, measure the
+    pixel count of just the non-white content region (crop out the
+    margins) instead of the full padded canvas. A clean full-bleed cover
+    is unaffected (its content region ~= its full canvas), while a
+    padded image's inflated whitespace no longer counts in its favour.
+    """
+    if not data:
+        return (0, 0)
+    w, h = measure_image_bytes(data)
+    if w <= 0 or h <= 0:
+        return (0, 0)
+    pixels = w * h
+    try:
+        if has_white_border_padding(data):
+            import io as _io
+            from PIL import Image as _PIL  # type: ignore
+            import numpy as _np
+            img = _PIL.open(_io.BytesIO(data)).convert('RGB')
+            arr = _np.array(img)
+            non_white = ~(arr > 240).all(axis=2)  # True where pixel is NOT near-white
+            rows = _np.where(non_white.any(axis=1))[0]
+            cols = _np.where(non_white.any(axis=0))[0]
+            if len(rows) and len(cols):
+                content_h = int(rows[-1] - rows[0] + 1)
+                content_w = int(cols[-1] - cols[0] + 1)
+                content_pixels = content_w * content_h
+                if 0 < content_pixels < pixels:
+                    pixels = content_pixels
+    except Exception:
+        pass
+    return (pixels, len(data))
+
+
 def best_cover(cover_candidates, min_size=200):
-    """Return the highest-scoring non-audiobook cover URL (heuristic, no download)."""
+    """
+    Return the highest-scoring non-audiobook cover URL (heuristic, no download).
+    cover_candidates: iterable of (url, weight) or (url, weight, source) tuples
+    — only the first two positions are used here.
+    """
     best_url, best_score = None, -1
-    for url, weight in cover_candidates:
+    for cand in cover_candidates:
+        url, weight = cand[0], cand[1]
         s = score_cover(url)
         if s < 0:          # audiobook — skip entirely
             continue
@@ -822,16 +1152,36 @@ def best_cover(cover_candidates, min_size=200):
 
 def probe_best_cover(cover_candidates, timeout=8, log=None):
     """
-    Score all candidates, HEAD-probe the top 6 (excluding audiobook URLs),
-    return the one with the largest actual file size. Falls back to the
-    heuristic winner.
+    Score all candidates, then actually DOWNLOAD and content-validate the
+    top few (excluding audiobook URLs) in score order, returning the first
+    one that is a real, non-blank, reasonably-sized image. Falls back to
+    the heuristic winner only if every probed candidate fails validation.
+
+    cover_candidates: iterable of (url, weight) or (url, weight, source)
+    tuples — only the first two positions are used here.
+
+    v6.2.28 ROOT-CAUSE FIX: this used to be a cheap HEAD-only Content-
+    Length probe with NO image-content awareness at all — it just picked
+    whichever candidate reported the largest byte size over HEAD/ranged-
+    GET. That is exactly how a Google Books "image not available"
+    placeholder (a real, non-tiny, valid JPEG — see
+    is_google_placeholder_cover()'s docstring) kept winning "Best probed
+    cover" even after upstream fixes stopped fabricating speculative
+    Google cover URLs: Google's own imageLinks metadata can point at a
+    placeholder for a genuinely coverless volume, and a HEAD probe cannot
+    tell that apart from a real cover of similar file size. Now each
+    candidate is fully downloaded (not just HEAD'd) and run through
+    is_blank_or_placeholder_image() before being trusted — the same
+    validation the Cover Chooser dialog already applies — so the
+    automatic "best" pick and the manual picker can no longer disagree
+    about which candidates are real.
     """
     if not cover_candidates:
         return None
 
     # Filter audiobook URLs before scoring
-    clean = [(url, w) for url, w in cover_candidates
-             if url and score_cover(url) >= 0]
+    clean = [(cand[0], cand[1]) for cand in cover_candidates
+             if cand[0] and score_cover(cand[0]) >= 0]
     if not clean:
         return None
 
@@ -843,22 +1193,44 @@ def probe_best_cover(cover_candidates, timeout=8, log=None):
         return None
 
     import threading
-    top = [u for _, u in scored[:6]]
-    sizes = {}
+    top = [u for _, u in scored[:8]]
+    results = {}
     lock = threading.Lock()
 
-    def probe(u):
-        cl = _head_content_length(u, timeout=timeout, log=log)
+    def fetch_and_validate(u):
+        data = _http_get_bytes(u, timeout=timeout, log=log)
+        ok = False
+        if data and len(data) > 2000:
+            try:
+                ok = not is_blank_or_placeholder_image(data, url=u, log=log)
+            except Exception:
+                ok = True  # validation itself failed — don't punish the candidate
         with lock:
-            sizes[u] = cl
+            results[u] = (len(data) if data else 0, ok)
 
-    threads = [threading.Thread(target=probe, args=(u,), daemon=True) for u in top]
+    threads = [threading.Thread(target=fetch_and_validate, args=(u,), daemon=True)
+               for u in top]
     for t in threads: t.start()
-    for t in threads: t.join(timeout=timeout + 1)
+    for t in threads: t.join(timeout=timeout + 2)
 
-    probed = [(sizes.get(u, 0), u) for u in top if sizes.get(u, 0) > 2000]
-    if probed:
-        return max(probed, key=lambda x: x[0])[1]
+    # Prefer the highest-scoring candidate (top-first order preserved) that
+    # both downloaded successfully AND passed content validation.
+    for u in top:
+        size, ok = results.get(u, (0, False))
+        if size > 2000 and ok:
+            return u
+
+    # Nothing validated cleanly — fall back to the largest-downloaded one
+    # that at least isn't a zero-byte failure, rather than a confirmed
+    # placeholder, so a real-but-unvalidatable image still beats nothing.
+    downloaded = [(results[u][0], u) for u in top if results.get(u, (0, False))[0] > 2000]
+    if downloaded:
+        if log:
+            log.warning('probe_best_cover: no candidate passed content '
+                        'validation — falling back to largest downloaded '
+                        '(%d candidates tried)', len(top))
+        return max(downloaded, key=lambda x: x[0])[1]
+
     return scored[0][1]
 
 
@@ -916,7 +1288,12 @@ def fetch_google(title, author, isbn, asin='', lang='', timeout=20, retries=2, l
     one book does not poison subsequent books in the same run.
     Tries: isbn lookup → intitle/inauthor → plain query → ASIN keyword.
     Picks the candidate with the best title/author match + richest synopsis.
-    Never restricts by language.
+    Does not hard-restrict by language (a langRestrict query param caused
+    zero-result regressions on some books whose language Google mis-tags),
+    but candidates whose reported language matches the book's language get
+    a large scoring bonus (v6.2.26) so a same-language edition is preferred
+    over a richer-looking wrong-language one when Google returns several
+    editions for the same query.
 
     v6.2.12: if the user has set an API key (Options tab → Google Books API
     Key), it's appended to every request. The anonymous/keyless quota is
@@ -949,6 +1326,8 @@ def fetch_google(title, author, isbn, asin='', lang='', timeout=20, retries=2, l
     if asin and not isbn:
         queries.append(quote_plus(asin))
 
+    _target_lang = (lang or '').lower()[:2]
+
     for q in queries:
         if not q:
             continue
@@ -976,6 +1355,12 @@ def fetch_google(title, author, isbn, asin='', lang='', timeout=20, retries=2, l
             score += min(len(desc), 2000) / 4.0
             if info.get('imageLinks'):
                 score += 10
+            if _target_lang:
+                cand_lang = (info.get('language', '') or '').lower()[:2]
+                if cand_lang == _target_lang:
+                    score += 600
+                elif cand_lang:
+                    score -= 400
             return score
 
         # FOURTH bug (this fix): _candidate_score always returned
@@ -1049,23 +1434,39 @@ def fetch_google(title, author, isbn, asin='', lang='', timeout=20, retries=2, l
         raw   = (thumb.get('extraLarge') or thumb.get('large') or
                  thumb.get('medium') or thumb.get('thumbnail') or '')
         cover_alts = []
-        if volume_id:
-            cover_alts.append(
-                'https://books.google.com/books/content?id={}'
-                '&printsec=frontcover&img=1&zoom=1&source=gbs_api'.format(volume_id))
-            cover_alts.append(
-                'https://books.google.com/books/content?id={}'
-                '&printsec=frontcover&img=1&zoom=2&source=gbs_api'.format(volume_id))
-            cover_alts.append(
-                'https://books.google.com/books/content?id={}'
-                '&printsec=frontcover&img=1&zoom=6&source=gbs_api'.format(volume_id))
+        # v6.2.27 ROOT-CAUSE FIX for "image not available" covers reaching
+        # the final choice/auto-select: this used to build 3 speculative
+        # id-based frontcover URLs for EVERY candidate that had a volume_id,
+        # regardless of whether Google's own volumeInfo.imageLinks said a
+        # cover actually exists. Those URLs don't 404 for a coverless
+        # volume -- they return Google's real, valid, non-tiny "image not
+        # available" placeholder JPEG, which passed every size/HEAD-probe
+        # check downstream and got auto-picked as "best" cover (field-
+        # confirmed: books.google.com/books/content?id=t5Ke0QEACAAJ...).
+        # They were also listed BEFORE the confirmed-real `raw` thumbnail
+        # URL, so even when a real cover DID exist, the speculative guess
+        # could still be tried/shown first.
+        #
+        # Fix: only ever build a books.google.com/content URL when
+        # imageLinks confirms Google has *some* thumbnail for this volume
+        # (raw is non-empty) -- and even then, the confirmed real `raw` URL
+        # (and its higher-res zoom variants) come first, with the id-based
+        # guess added only as one extra last-resort alternative. If
+        # imageLinks is empty, no Google cover is offered for this
+        # candidate at all: no cover is strictly better than a guaranteed
+        # placeholder that can outrank a real Amazon/Goodreads cover.
         if raw:
             clean = re.sub(r'[&?]zoom=\d', '', raw)
             clean = re.sub(r'[&?]edge=\w+', '', clean).rstrip('&?')
             cover_alts.append(clean + ('&' if '?' in clean else '?') + 'zoom=6&fife=w1200')
             cover_alts.append(clean + ('&' if '?' in clean else '?') + 'zoom=3')
+            cover_alts.append(raw)
+            if volume_id:
+                cover_alts.append(
+                    'https://books.google.com/books/content?id={}'
+                    '&printsec=frontcover&img=1&zoom=6&source=gbs_api'.format(volume_id))
 
-        cover_url = cover_alts[0] if cover_alts else raw
+        cover_url = cover_alts[0] if cover_alts else ''
         comments = info.get('description', '') or info.get('subtitle', '')
 
         return {
@@ -1697,6 +2098,32 @@ def fetch_isbndb(title, author, isbn, api_key, asin='', lang='', timeout=20, ret
 
 # ── Amazon ─────────────────────────────────────────────────────────────────────
 
+def _title_plausible_match(a, b, min_similarity=20):
+    """
+    True unless `a` and `b` are clearly unrelated titles. Deliberately more
+    lenient than fuzzy.title_matches() — this only exists to catch the
+    "completely wrong product" case (e.g. Amazon search surfacing a movie
+    for a book query), not to judge edition/translation differences.
+
+    A bare similarity() threshold is NOT safe here: similarity() penalizes
+    length mismatches heavily (Jaccard word-overlap + Levenshtein), so a
+    common and totally legitimate case — calibre's short title vs Amazon's
+    "Title: Full Subtitle Here" — can score LOWER than a genuinely
+    unrelated pair (field-checked: "Tecnofascismo" vs its own full
+    title+subtitle scored 15, while an unrelated book/movie pair scored
+    12 — too close together for any single cutoff to separate safely).
+    So a substring-containment check (handles truncation/subtitles) is
+    tried first, with similarity() only as a fallback for everything else.
+    """
+    na, nb = normalize_str(a), normalize_str(b)
+    if not na or not nb:
+        return True  # can't tell — don't block on missing data
+    shorter, longer = (na, nb) if len(na) <= len(nb) else (nb, na)
+    if shorter and shorter in longer:
+        return True
+    return similarity(a, b) >= min_similarity
+
+
 def fetch_amazon(title, author, isbn, asin='', lang='', timeout=20, retries=2, log=None):
     """
     Fetches from the language-appropriate Amazon storefront.
@@ -1769,46 +2196,100 @@ def fetch_amazon(title, author, isbn, asin='', lang='', timeout=20, retries=2, l
             elif log:
                 log.debug('Amazon: dp/ page for ASIN %s parsed but no usable '
                           'title found (page was %d bytes)', asin, len(raw))
-        # Also try the local TLD if .com fails (e.g. some regional Kindle titles)
-        if not result and local_tld != 'amazon.com':
+        # v6.2.31: also try the local TLD when .com gave a title but no
+        # description — same Kindle-region-exclusivity issue as the ISBN
+        # path below. A local result WITH a description replaces a bare
+        # .com one; a local result without one only fills in if .com had
+        # nothing at all.
+        if (not result or not result.get('comments')) and local_tld != 'amazon.com':
             url2 = 'https://www.{}/dp/{}'.format(local_tld, asin)
             if log:
                 log.info('Amazon: trying %s dp/ for ASIN %s', local_tld, asin)
             raw2 = _amazon_fetch(url2, timeout, 1, hdrs, log)
             if raw2:
-                result = _parse_amazon_page(raw2, asin, log=log)
-                if result and log:
-                    log.info('Amazon: got result via %s dp/ %s', local_tld, asin)
+                local_result = _parse_amazon_page(raw2, asin, log=log)
+                if local_result and local_result.get('comments'):
+                    result = local_result
+                    if log:
+                        log.info('Amazon: got result (with description) via '
+                                 '%s dp/ %s', local_tld, asin)
+                elif local_result and not result:
+                    result = local_result
+                    if log:
+                        log.info('Amazon: got result via %s dp/ %s', local_tld, asin)
                 elif log:
                     log.debug('Amazon: %s dp/ page for ASIN %s parsed but no '
                               'usable title found', local_tld, asin)
 
     # ── 2. Direct dp/ lookup by ISBN ─────────────────────────────────────────
-    if not result and isbn:
-        if log:
-            log.info('Amazon: trying dp/ lookup for ISBN %s', isbn)
-        url = 'https://www.amazon.com/dp/{}'.format(isbn)
-        raw = _amazon_fetch(url, timeout, retries, hdrs, log)
-        if raw:
-            result = _parse_amazon_page(raw, isbn, log=log)
-            if result and log:
-                log.info('Amazon: got result via ISBN dp/ %s', isbn)
-            elif log:
-                log.debug('Amazon: dp/ page for ISBN %s parsed but no usable '
-                          'title found', isbn)
-        # Also try local TLD — regional ISBNs often resolve better there
-        if not result and local_tld != 'amazon.com':
-            url2 = 'https://www.{}/dp/{}'.format(local_tld, isbn)
+    # v6.2.29 ROOT-CAUSE FIX: Amazon's dp/<id> path takes an ASIN or an
+    # ISBN-10 — it does NOT resolve 13-digit ISBNs (field-confirmed: dp/
+    # lookups for a valid ISBN-13 consistently returned a real-but-useless
+    # "notitle" page on both amazon.com and the local TLD, for a book that
+    # demonstrably exists and has a normal product page under its ISBN-10).
+    # This silently produced zero Amazon data for every ISBN-13-only book —
+    # and since "amazon_direct_only" (on by default) also skips the search
+    # fallback whenever an ISBN is known, Amazon contributed NOTHING at
+    # all, with no obvious sign why. Now the dp/ URL is built from the
+    # ISBN-10 form whenever the given ISBN converts (nearly all 978-prefix
+    # ISBN-13s do); the original string is tried too, in case of an
+    # already-ISBN-10 identifier or a Kindle-only listing that happens to
+    # accept the 13-digit form.
+    _isbn10 = isbn13_to_10(isbn) if isbn else None
+    _dp_isbn_candidates = []
+    if _isbn10 and _isbn10 != isbn:
+        _dp_isbn_candidates.append(_isbn10)
+    if isbn:
+        _dp_isbn_candidates.append(isbn)
+
+    if not result and _dp_isbn_candidates:
+        for _dp_id in _dp_isbn_candidates:
+            if result and result.get('comments'):
+                break
             if log:
-                log.info('Amazon: trying %s dp/ for ISBN %s', local_tld, isbn)
-            raw2 = _amazon_fetch(url2, timeout, 1, hdrs, log)
-            if raw2:
-                result = _parse_amazon_page(raw2, isbn, log=log)
+                log.info('Amazon: trying dp/ lookup for ISBN %s', _dp_id)
+            url = 'https://www.amazon.com/dp/{}'.format(_dp_id)
+            raw = _amazon_fetch(url, timeout, retries, hdrs, log)
+            if raw:
+                result = _parse_amazon_page(raw, _dp_id, log=log)
                 if result and log:
-                    log.info('Amazon: got result via %s dp/ %s', local_tld, isbn)
+                    log.info('Amazon: got result via ISBN dp/ %s', _dp_id)
                 elif log:
-                    log.debug('Amazon: %s dp/ page for ISBN %s parsed but no '
-                              'usable title found', local_tld, isbn)
+                    log.debug('Amazon: dp/ page for ISBN %s parsed but no usable '
+                              'title found', _dp_id)
+            # v6.2.31 ROOT-CAUSE FIX: previously this only ran when `result`
+            # was still empty, so a "got a title but no description"
+            # amazon.com page (field-confirmed: Kindle ebooks are commonly
+            # exclusive to one regional storefront — amazon.com showed a
+            # bare cross-market listing for a book that's actually sold on
+            # amazon.es, with a full "Descripción del producto" only on the
+            # .es page) permanently short-circuited Amazon's synopsis
+            # contribution even though the real content was one TLD away.
+            # Now the local TLD is also tried whenever the .com result is
+            # missing a description, and if the local page has one, its
+            # richer result REPLACES the bare .com one (rather than being
+            # discarded just because .com "succeeded" first).
+            if (not result or not result.get('comments')) and local_tld != 'amazon.com':
+                url2 = 'https://www.{}/dp/{}'.format(local_tld, _dp_id)
+                if log:
+                    log.info('Amazon: trying %s dp/ for ISBN %s (%s)',
+                             local_tld, _dp_id,
+                             'no result yet' if not result else 'got title but no description on .com')
+                raw2 = _amazon_fetch(url2, timeout, 1, hdrs, log)
+                if raw2:
+                    local_result = _parse_amazon_page(raw2, _dp_id, log=log)
+                    if local_result and local_result.get('comments'):
+                        result = local_result
+                        if log:
+                            log.info('Amazon: got result (with description) via '
+                                     '%s dp/ %s', local_tld, _dp_id)
+                    elif local_result and not result:
+                        result = local_result
+                        if log:
+                            log.info('Amazon: got result via %s dp/ %s', local_tld, _dp_id)
+                    elif log:
+                        log.debug('Amazon: %s dp/ page for ISBN %s parsed but no '
+                                  'usable title found', local_tld, _dp_id)
 
     # ── 3. Search fallback on the language-appropriate TLD ───────────────────
     # Skip the search when a direct ASIN/ISBN is already known and the user
@@ -1822,9 +2303,26 @@ def fetch_amazon(title, author, isbn, asin='', lang='', timeout=20, retries=2, l
     except Exception:
         pass
     _skip_search = _direct_only and bool(asin or isbn)
+    if not result and _skip_search:
+        # v6.2.29: this is the actual "why did Amazon return nothing" case
+        # — the direct ASIN/ISBN dp/ lookup(s) above all failed AND
+        # amazon_direct_only is suppressing the title-search fallback that
+        # would otherwise have found the book. This used to be a debug-
+        # level message behind a condition that could never actually be
+        # true when a search was really being skipped (comparing
+        # `_skip_search is False` while describing the skip-search case),
+        # so it never printed when it mattered. Now a clear, actionable
+        # WARNING explains exactly what happened and how to change it.
+        if log:
+            log.warning(
+                'Amazon: direct dp/ lookup found no usable page for %s — '
+                'title-search fallback was NOT tried because "Amazon: '
+                'direct lookup only" is enabled in Options (Options > '
+                'Browser Fallback). Amazon will contribute nothing for '
+                'this book. Disable that setting if you want Amazon '
+                'tried via title search whenever the direct lookup fails.',
+                asin or isbn)
     if not result and (title or author) and not _skip_search:
-        if log and _skip_search is False and _direct_only:
-            log.debug('Amazon: direct-only mode — skipping title search (ASIN/ISBN known)')
         if _amazon_search_in_cooldown(local_tld):
             if log:
                 log.warning('Amazon: skipping search fallback on %s (in 503 cooldown)', local_tld)
@@ -1857,6 +2355,27 @@ def fetch_amazon(title, author, isbn, asin='', lang='', timeout=20, retries=2, l
             # costs little and makes consecutive requests look less robotic.
             time.sleep(0.4 + (hash(surl) % 50) / 100.0)  # ~0.4-0.9s, deterministic jitter
             raw = _amazon_fetch(surl, timeout, retries, hdrs, log)
+
+            # v6.2.30: previously, a search that failed outright (timeout,
+            # 503/bot-block) on the local TLD just gave up for THIS book —
+            # the existing "fall back to .com" logic only helped a LATER
+            # book in the same session avoid retrying a TLD already known
+            # to be in cooldown, which does nothing for the book that just
+            # failed. Now: if the local-TLD search produced no content at
+            # all and we weren't already trying amazon.com, immediately
+            # retry once on amazon.com in the same call — product/search
+            # pages on .com are frequently less aggressively gated than a
+            # just-hit regional storefront, and this gives the CURRENT book
+            # a real second chance instead of only helping the next one.
+            if not raw and local_tld != _DEFAULT_AMAZON_TLD:
+                if log:
+                    log.info('Amazon: search on %s failed outright — '
+                             'retrying once on %s', local_tld, _DEFAULT_AMAZON_TLD)
+                surl2 = 'https://www.{}/s?k={}&i=stripbooks'.format(_DEFAULT_AMAZON_TLD, q)
+                raw = _amazon_fetch(surl2, timeout, 1, hdrs, log)
+                if raw:
+                    local_tld = _DEFAULT_AMAZON_TLD
+
             if raw:
                 # Collect all data-asin values from the results page.
                 # data-asin can contain ISBN-10s (all-digit 10-char strings)
@@ -1883,6 +2402,39 @@ def fetch_amazon(title, author, isbn, asin='', lang='', timeout=20, retries=2, l
                               'but no data-asin values were found in it (page '
                               'layout may have changed, or zero results)', local_tld)
 
+                # v6.2.26: previously accepted the FIRST candidate that
+                # parsed a title, with no language check at all — so on a
+                # storefront that stocks multiple language editions (every
+                # Amazon TLD does; amazon.it lists Spanish/English/etc.
+                # editions too), a wrong-language edition could win just for
+                # appearing first in the search results. Now every parseable
+                # candidate is checked against the requested `lang` (when
+                # known); a same-language match is taken immediately, and a
+                # wrong-language match is kept only as a fallback in case no
+                # same-language candidate turns up among the (up to 5) tried.
+                # v6.2.32 ROOT-CAUSE FIX: this loop validated LANGUAGE but
+                # never validated that a search candidate is even the same
+                # BOOK — a weak/no-match search (e.g. a self-published
+                # Spanish title with no real amazon.com listing) can have
+                # Amazon's search surface a data-asin for something from a
+                # completely different department (field-confirmed: a
+                # search for "Las hechiceras de Madrid Las Tres Amigas"
+                # returned a Prime Video show, "Ver The Other End of the
+                # Rope | Prime Video", as its data-asin candidate — real
+                # HTML, a real title, a real "result", just for the wrong
+                # product entirely). That got discarded later at merge time
+                # by the title-similarity check there, so no wrong data
+                # reached calibre — but it wasted a full page fetch, logged
+                # a misleading "Got result from amazon" line, and (in a
+                # book that DOES have a real Amazon match a few candidates
+                # down the list) could have blocked trying the rest of the
+                # candidates if this were the language match. Now a basic
+                # title-relevance floor applies before language is even
+                # considered: a candidate whose extracted title doesn't
+                # resemble the book's title at all is skipped immediately,
+                # not accepted as "the result".
+                _target_lang = (lang or '').lower()[:2]
+                _fallback_result = None
                 for found_id in candidates:
                     if log:
                         log.info('Amazon: search candidate %s, fetching dp/ page', found_id)
@@ -1891,8 +2443,27 @@ def fetch_amazon(title, author, isbn, asin='', lang='', timeout=20, retries=2, l
                     if praw:
                         candidate_result = _parse_amazon_page(praw, found_id, log=log)
                         if candidate_result and candidate_result.get('title'):
-                            result = candidate_result
-                            break
+                            if title and not _title_plausible_match(title, candidate_result['title']):
+                                if log:
+                                    log.info(
+                                        'Amazon: candidate %s title %r does not '
+                                        'resemble %r — likely a wrong/unrelated '
+                                        'product, not just a wrong edition; skipping',
+                                        found_id, candidate_result['title'][:60],
+                                        title[:60])
+                                continue
+                            cand_lang = (candidate_result.get('language') or '').lower()[:2]
+                            if not _target_lang or not cand_lang or cand_lang == _target_lang:
+                                result = candidate_result
+                                break
+                            # Wrong language confirmed — remember as a last
+                            # resort but keep looking for a better match.
+                            if log:
+                                log.info('Amazon: candidate %s is %r edition, '
+                                         'book is %r — trying next candidate',
+                                         found_id, cand_lang, _target_lang)
+                            if _fallback_result is None:
+                                _fallback_result = candidate_result
                         elif log:
                             log.debug('Amazon: dp/ page for candidate %s was real '
                                       'HTML but no title could be parsed from it '
@@ -1901,6 +2472,13 @@ def fetch_amazon(title, author, isbn, asin='', lang='', timeout=20, retries=2, l
                         log.debug('Amazon: dp/ fetch for candidate %s returned '
                                   'no content (timeout/network error) — trying '
                                   'next candidate', found_id)
+                if not result and _fallback_result is not None:
+                    if log:
+                        log.info('Amazon: no %r-language candidate found among %d '
+                                 'tried — falling back to closest match (%r)',
+                                 _target_lang, len(candidates),
+                                 (_fallback_result.get('language') or '?'))
+                    result = _fallback_result
 
     if result:
         idents = result.setdefault('identifiers', {})
@@ -2091,6 +2669,70 @@ def _parse_amazon_page(raw, identifier, log=None):
             _dump_amazon_debug_html(raw, identifier, 'notitle', log)
         return {}
 
+    # ── Language extraction (v6.2.26) ────────────────────────────────────────
+    # ROOT CAUSE of "Spanish edition picked for an Italian book search on
+    # amazon.it": _parse_amazon_page never extracted a language at all, so
+    # fetch_amazon's search-candidate loop had no way to tell a Spanish
+    # Kindle edition apart from an Italian one — it just accepted whichever
+    # of the first few data-asin candidates parsed a title. Amazon storefronts
+    # sell books in every language regardless of TLD (amazon.it stocks
+    # Spanish, English, etc. editions too), so the TLD alone is not a
+    # reliable language signal.
+    #
+    # Two signals are checked, cheapest/most reliable first:
+    #   1. The edition marker still present in the *raw* (uncleaned) title
+    #      fragment, e.g. "(Spanish Edition)" / "(Edición española)" /
+    #      "(edizione italiana)" — _clean_amazon_title() strips this before
+    #      we ever see it above, so we re-derive it from _title_raw's source
+    #      fragment captured before cleaning would have removed it. Since we
+    #      don't keep that pre-clean string around, we re-search the raw
+    #      page HTML directly for the same marker patterns instead.
+    #   2. The "Language" / "Idioma" / "Lingua" / "Langue" / "Sprache" row in
+    #      Amazon's product-details panel, which is present on most product
+    #      pages regardless of storefront language.
+    _AMAZON_LANG_WORDS = {
+        'en': ('english', 'inglés', 'ingles', 'inglese', 'englisch', 'anglais'),
+        'es': ('spanish', 'español', 'espanol', 'spagnolo', 'espagnol', 'castellano'),
+        'it': ('italian', 'italiano', 'italien', 'italienisch'),
+        'fr': ('french', 'francés', 'frances', 'francese', 'français', 'francais', 'franzosisch'),
+        'de': ('german', 'alemán', 'aleman', 'tedesco', 'deutsch', 'allemand'),
+        'pt': ('portuguese', 'portugués', 'portugues', 'portoghese', 'português', 'portugais'),
+        'ro': ('romanian', 'rumano', 'rumeno', 'română', 'romana', 'roumain'),
+        'nl': ('dutch', 'holandés', 'olandese', 'niederländisch', 'néerlandais'),
+    }
+    _lang_word_alt = '|'.join(w for words in _AMAZON_LANG_WORDS.values() for w in words)
+
+    def _lang_code_for_word(word):
+        word = word.lower()
+        for code, words in _AMAZON_LANG_WORDS.items():
+            if word in words:
+                return code
+        return ''
+
+    detected_lang = ''
+
+    # Signal 1: edition marker anywhere in the raw page ("(Spanish Edition)",
+    # "(Edición española)", "(edizione italiana)", etc.)
+    m = re.search(
+        r'\(\s*(?:edici[oó]n|edizione)?\s*({})\s*(?:edition|edici[oó]n|edizione)?\s*\)'
+        .format(_lang_word_alt),
+        raw, re.I)
+    if m:
+        detected_lang = _lang_code_for_word(m.group(1))
+
+    # Signal 2: product-details "Language:"/"Idioma:"/"Lingua:" row.
+    if not detected_lang:
+        m = re.search(
+            r'(?:language|idioma|lingua|langue|sprache)\s*'
+            r'(?:</[^>]+>\s*)?[:\uFF1A]?\s*(?:</?[^>]*>\s*)*({})'
+            .format(_lang_word_alt),
+            raw, re.I)
+        if m:
+            detected_lang = _lang_code_for_word(m.group(1))
+
+    if detected_lang:
+        result['language'] = detected_lang
+
     # ── Authors extraction ────────────────────────────────────────────────────
     authors = re.findall(r"class=[\"']author[\"'][^>]*>.*?<a[^>]*>(.*?)</a>", raw, re.S)
     if authors:
@@ -2240,10 +2882,22 @@ def _parse_amazon_page(raw, identifier, log=None):
     # by a colon-separated structure ending in a store-section label
     # (Tienda Kindle / Libros / Kindle Store / eBooks / Libri), which never
     # occurs in genuine synopsis prose.
+    # v6.2.26: previously this only matched when "Amazon.<tld>:" appeared at
+    # the START of the string. Field-confirmed variant has the book's own
+    # title first and "Amazon.<tld>: <section>" trailing at the END instead
+    # — e.g. "Tecnofascismo: ... (Spanish Edition) eBook : Cesare, Donatella
+    # di, Cortés Fernández, Lara: Amazon.it: Kindle Store" — which the
+    # start-anchored pattern let straight through as a "182 char synopsis".
+    # Now matches either ordering.
+    _AMAZON_TLDS_RE = (r'com|es|it|fr|de|co\.uk|co\.jp|com\.br|nl|pl|se|'
+                       r'com\.tr|ae|in|cn|ca|com\.mx')
+    _AMAZON_STORE_SECTIONS_RE = (r'tienda kindle|kindle store|libros|'
+                                 r'libri(?: in altre lingue)?|ebooks?|livres|'
+                                 r'b[üu]cher|boutique kindle|ebook kindle')
     _AMAZON_PAGE_TITLE_RE = re.compile(
-        r'^\s*amazon\.(?:com|es|it|fr|de|co\.uk|co\.jp|com\.br|nl|pl|se|com\.tr|ae|in|cn|ca|com\.mx)\s*:'
-        r'.*:\s*(?:tienda kindle|kindle store|libros|libri(?: in altre lingue)?|'
-        r'ebooks?|livres|b[üu]cher|boutique kindle|ebook kindle)\s*$',
+        r'^\s*amazon\.(?:{tld})\s*:.*:\s*(?:{sec})\s*$'
+        r'|:\s*amazon\.(?:{tld})\s*:\s*(?:{sec})\s*$'
+        .format(tld=_AMAZON_TLDS_RE, sec=_AMAZON_STORE_SECTIONS_RE),
         re.I,
     )
 
@@ -2349,6 +3003,23 @@ def _parse_amazon_page(raw, identifier, log=None):
                 desc = candidate
 
     if len(desc) >= 30:
+        # v6.2.27 bugfix: collapsible description blocks (bookDescription_
+        # feature_div, a-expander-content) include their own "Read more" /
+        # "Leggi di più" toggle-button INSIDE the div whose HTML we strip
+        # tags from above -- the button's visible label survives as plain
+        # text glued onto the end of the real synopsis (field-confirmed:
+        # an Italian Amazon page's synopsis ended in "...Leggi di più").
+        # Strip it before saving.
+        _READMORE_TRAILING_RE = re.compile(
+            r'\s*(?:\.{3}|…)?\s*(?:leggi\s+di\s+pi[uù]|read\s+more|show\s+more|'
+            r'see\s+more|continue\s+reading|'
+            r'leer\s+m[aá]s|ver\s+m[aá]s|mostrar\s+m[aá]s|'
+            r'cite[sș]te\s+mai\s+mult|vezi\s+mai\s+mult|afl[aă]\s+mai\s+multe|'
+            r'lire\s+la\s+suite|en\s+savoir\s+plus|'
+            r'mehr\s+lesen|weiterlesen)\s*[»›》]?\s*$',
+            re.I,
+        )
+        desc = _READMORE_TRAILING_RE.sub('', desc).rstrip()
         result['comments'] = desc
 
     cover_pats = [

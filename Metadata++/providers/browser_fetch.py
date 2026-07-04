@@ -4,9 +4,52 @@ __license__ = 'GPL v3'
 """
 browser_fetch.py -- Playwright/Firefox browser layer -- MetadataPlusPlus
 
-Runs Playwright in a system-Python subprocess and reuses one Firefox
-browser/context/page across browser_get() calls.  This keeps visible Firefox
-usage to one window per calibre/plugin process instead of one window per URL.
+Provides browser_get(), a drop-in complement to providers._get() that drives
+a real Firefox browser instead of urllib, bypassing bot-detection systems that
+fingerprint server-side HTTP requests (missing browser headers, wrong TLS
+fingerprint, no JS execution, etc.).
+
+REQUIRES (one-time system-wide setup -- install into the SYSTEM Python):
+    pip install playwright
+    playwright install firefox
+
+Architecture
+------------
+Playwright runs in a SYSTEM PYTHON SUBPROCESS, not inside Calibre's bundled
+Python.  This is the only reliable approach because:
+
+  - Calibre embeds its own Python interpreter.
+  - Installing playwright into Calibre's Python causes dependency conflicts.
+  - Even with sys.path injection, compiled C extensions (greenlet, the
+    playwright browser binaries) built for one Python version cannot load
+    inside a different Python's interpreter (ABI mismatch).
+
+Single-window worker (merged fix)
+----------------------------------
+Earlier releases launched a brand-new Firefox subprocess (and therefore a
+brand-new visible window) for EVERY browser_get() call -- one window per
+URL, with a ~3-5s Firefox-launch cost paid every single time. The plugin
+now starts ONE long-lived worker subprocess that keeps a single Firefox
+browser/context/page alive and reuses it across every browser_get() call
+for the life of the calibre/plugin process, talking to it over a simple
+line-based JSON stdin/stdout protocol. This keeps visible Firefox usage to
+one window total instead of one window per URL, and removes the repeated
+launch cost for every fetch after the first. If the worker's page/context
+ever becomes unusable (e.g. a hard navigation failure), the worker
+recreates just the context/page internally rather than spawning a new
+browser process or window.
+
+Each browser_get() call:
+  1. Finds the system Python that has playwright (cached after first probe).
+  2. Ensures the persistent worker subprocess is running (starts it once).
+  3. Sends the URL as a JSON request line and reads back the rendered HTML.
+
+Integration pattern in providers.py
+-------------------------------------
+    raw = _get(url, timeout, retries, headers=hdrs, log=log)
+    if (not raw or <blocked_check>(raw)) and _browser_fallback_enabled():
+        log.info('Source: urllib blocked -- retrying via browser')
+        raw = _browser_get(url, headers=hdrs, timeout=timeout, log=log)
 """
 
 import atexit
@@ -18,53 +61,36 @@ import tempfile
 import threading
 
 # Suppress console windows created by subprocess calls on Windows.
+# Without this every Popen/run call spawns a visible black CMD window.
 _CREATE_NO_WINDOW = 0x08000000 if sys.platform == 'win32' else 0
+
 
 # ── System Python discovery ────────────────────────────────────────────────────
 _find_lock             = threading.Lock()
-_system_python_cmd     = None
-_system_python_checked = False
+_system_python_cmd     = None   # e.g. ['py', '-3.11'] or ['python']
+_system_python_checked = False  # True after first probe (even if none found)
 
-# ── Browser worker state ───────────────────────────────────────────────────────
+# ── Persistent browser worker state ────────────────────────────────────────────
+# Only one Firefox worker (and therefore one Firefox window) at a time. Browser
+# calls are serialised through this same semaphore so requests queue rather
+# than racing to talk to the worker's stdin/stdout concurrently.
 _browser_semaphore = threading.Semaphore(1)
 _worker_lock       = threading.Lock()
 _worker_proc       = None
 _worker_key        = None
 _worker_script     = None
 
-# Use the same UA a real Firefox 125 on Windows 10 x64 sends.
-_FIREFOX_UA = (
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) '
-    'Gecko/20100101 Firefox/125.0'
-)
-
-_STEALTH_JS = (
-    "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
-    "if(navigator.plugins.length===0){"
-    "Object.defineProperty(navigator,'plugins',{get:()=>{"
-    "const a=[1,2,3];a.item=i=>a[i];a.namedItem=()=>null;a.refresh=()=>{};return a;"
-    "}});"
-    "}"
-    "try{Object.defineProperty(navigator,'languages',{"
-    "get:()=>(navigator.language?[navigator.language,'en']:['en-US','en'])"
-    "});}catch(e){}"
-    "try{delete window.__playwright;}catch(e){}"
-    "try{delete window.__pw_manual;}catch(e){}"
-    "try{delete window.__PW_inspect;}catch(e){}"
-)
-
-_FF_PREFS = {
-    'media.peerconnection.enabled':              False,
-    'privacy.resistFingerprinting':              False,
-    'app.update.auto':                           False,
-    'app.update.enabled':                        False,
-    'toolkit.telemetry.enabled':                 False,
-    'datareporting.healthreport.uploadEnabled':  False,
-}
-
 
 def _find_system_python_with_playwright():
-    """Find and cache a non-Calibre system Python with playwright installed."""
+    """
+    Find and cache the system Python command that has playwright installed.
+
+    Probes Python Launcher versioned variants first (py -3.12, py -3.11, ...)
+    then falls back to simple executable names.  Skips Calibre's own Python.
+
+    Returns a list like ['py', '-3.11'] or ['python'], or None if not found.
+    Thread-safe -- the expensive probe runs at most once per Calibre session.
+    """
     global _system_python_cmd, _system_python_checked
 
     if _system_python_checked:
@@ -78,6 +104,9 @@ def _find_system_python_with_playwright():
         calibre_exe  = os.path.normcase(os.path.realpath(sys.executable))
         check_script = 'from playwright.sync_api import sync_playwright; print("ok")'
 
+        # Python Launcher versioned variants -- try older/more-stable versions
+        # first since playwright is often installed for an LTS Python rather
+        # than the newest available (3.14 is very recent and may lack packages).
         py_launcher_variants = [
             ['py', '-3.12'], ['py', '-3.11'], ['py', '-3.10'],
             ['py', '-3.13'], ['py', '-3.9'],  ['py', '-3'],
@@ -85,6 +114,7 @@ def _find_system_python_with_playwright():
         simple_candidates = ['python3', 'python', 'py', 'python3.exe', 'python.exe']
 
         def _test(cmd_parts):
+            """Return True if cmd_parts runs a non-Calibre Python that has playwright."""
             try:
                 id_r = subprocess.run(
                     cmd_parts + ['-c', 'import sys; print(sys.executable)'],
@@ -96,7 +126,7 @@ def _find_system_python_with_playwright():
                         id_r.stdout.decode('utf-8', errors='replace').strip()
                     ))
                     if real == calibre_exe:
-                        return False
+                        return False  # this IS Calibre's Python -- skip it
                 r = subprocess.run(
                     cmd_parts + ['-c', check_script],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10,
@@ -119,15 +149,71 @@ def _find_system_python_with_playwright():
         return None
 
 
+# ── Firefox UA ─────────────────────────────────────────────────────────────────
+# Use the same UA a real Firefox 125 on Windows 10 x64 sends.
+# A Chrome UA paired with a Firefox TLS fingerprint is a high-confidence bot
+# signal on Cloudflare/Akamai/PerimeterX -- never mix them.
+_FIREFOX_UA = (
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) '
+    'Gecko/20100101 Firefox/125.0'
+)
+
+# ── Stealth JS (single-line so repr() embeds cleanly in the subprocess script) ─
+_STEALTH_JS = (
+    "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+    "if(navigator.plugins.length===0){"
+    "Object.defineProperty(navigator,'plugins',{get:()=>{"
+    "const a=[1,2,3];a.item=i=>a[i];a.namedItem=()=>null;a.refresh=()=>{};return a;"
+    "}});"
+    "}"
+    "try{Object.defineProperty(navigator,'languages',{"
+    "get:()=>(navigator.language?[navigator.language,'en']:['en-US','en'])"
+    "});}catch(e){}"
+    "try{delete window.__playwright;}catch(e){}"
+    "try{delete window.__pw_manual;}catch(e){}"
+    "try{delete window.__PW_inspect;}catch(e){}"
+)
+
+# ── Firefox user prefs (same for every call) ───────────────────────────────────
+_FF_PREFS = {
+    # Disable WebRTC -- local IP leaks are a common bot-detection signal.
+    'media.peerconnection.enabled':              False,
+    # Leave resistFingerprinting OFF -- its spoofed canvas/screen values are
+    # themselves a detection signal on sophisticated WAFs.
+    'privacy.resistFingerprinting':              False,
+    # Suppress background update/telemetry requests.
+    'app.update.auto':                           False,
+    'app.update.enabled':                        False,
+    'toolkit.telemetry.enabled':                 False,
+    'datareporting.healthreport.uploadEnabled':  False,
+}
+
+
+# ── Public API ─────────────────────────────────────────────────────────────────
+
 def is_browser_available():
-    """Return True if a system Python with playwright is reachable."""
+    """
+    Return True if a system Python with playwright is reachable.
+
+    The underlying probe runs at most once per Calibre session (cached).
+    Subsequent calls are a fast dict/bool lookup.
+    """
     return _find_system_python_with_playwright() is not None
 
 
 def browser_get(url, headers=None, timeout=30, log=None):
     """
-    Fetch `url` using a persistent Playwright Firefox worker.
-    Returns rendered HTML as str, or None on failure.
+    Fetch `url` using a persistent Playwright Firefox worker that reuses a
+    single browser window across calls. Returns the fully-rendered page
+    HTML as a str, or None on failure.
+
+    Parameters
+    ----------
+    url     : str  -- page to fetch
+    headers : dict -- optional extra HTTP request headers (Accept-Language
+                      is used to set the browser locale)
+    timeout : int  -- page-load timeout in seconds (default 30)
+    log           -- calibre/standard logger, or None
     """
     sys_python = _find_system_python_with_playwright()
     if sys_python is None:
@@ -140,6 +226,8 @@ def browser_get(url, headers=None, timeout=30, log=None):
             )
         return None
 
+    # Read headless and timeout from plugin prefs (fall back to defaults).
+    # DEBUG: default is False so Firefox window is visible for diagnosis.
     headless = False
     try:
         from calibre_plugins.metadata_plus.ui.config import prefs  # type: ignore
@@ -170,9 +258,10 @@ def browser_get(url, headers=None, timeout=30, log=None):
         'Sec-Fetch-User':            '?1',
     }
 
+    # Serialise: only one caller talks to the worker's stdin/stdout at a time.
     with _browser_semaphore:
         html = _worker_fetch(sys_python, url, extra_headers, locale,
-                             headless, timeout_ms, log)
+                              headless, timeout_ms, log)
     return html
 
 
@@ -202,8 +291,10 @@ def _worker_fetch(sys_python, url, extra_headers, locale, headless, timeout_ms, 
             if log:
                 log.warning('browser_fetch: worker failed for %s: %s',
                             url[:80], body[-300:] if body else '(no error)')
-            # Keep the worker alive: its script recreates page/context after
-            # navigation failures. Do not launch a fallback Firefox window here.
+            # Keep the worker (and its single Firefox window) alive: its
+            # script recreates the context/page internally after a
+            # navigation failure. Do not launch a whole new Firefox window
+            # here just because one fetch failed.
             return None
 
         if log:
@@ -219,6 +310,11 @@ def _worker_fetch(sys_python, url, extra_headers, locale, headless, timeout_ms, 
 
 
 def _ensure_worker(sys_python, headless, locale, extra_headers, log=None):
+    """
+    Start the persistent Firefox worker if it isn't already running with a
+    matching configuration, otherwise return the existing worker process.
+    This is what keeps browser usage down to a single, reused window.
+    """
     global _worker_proc, _worker_key, _worker_script
 
     key = (' '.join(sys_python), bool(headless), locale,
@@ -259,6 +355,13 @@ def _ensure_worker(sys_python, headless, locale, extra_headers, log=None):
 
 
 def _write_worker_script(headless, locale, extra_headers):
+    """
+    Build the long-lived worker script: launches ONE Firefox browser and
+    keeps a single context/page alive across requests read from stdin (one
+    JSON line per fetch), writing back an OK/ERR status line, a byte-length
+    line, and the raw response body -- so callers never spawn a second
+    Firefox window for subsequent fetches.
+    """
     script = '\n'.join([
         'import json, random, sys, time',
         'from playwright.sync_api import sync_playwright',
@@ -269,6 +372,10 @@ def _write_worker_script(headless, locale, extra_headers):
         f'_stealth_js = {repr(_STEALTH_JS)}',
         f'_ff_prefs = {repr(_FF_PREFS)}',
         '',
+        # ── Resource blocker (matches reference playwright_utils.py) ──────────
+        # Blocks heavy resources that don't contribute to metadata content:
+        # stylesheets, fonts, media, and known ad/analytics domains. Cover
+        # images from Amazon CDN and Goodreads are explicitly allowed.
         'def _block_resources(route, request):',
         '    u = request.url.lower()',
         '    if "m.media-amazon.com" in u or "images-na.ssl-images-amazon.com" in u:',
@@ -285,6 +392,7 @@ def _write_worker_script(headless, locale, extra_headers):
         '        return route.abort()',
         '    return route.continue_()',
         '',
+        # ── Amazon "Click to continue" challenge handler ───────────────────────
         'def _handle_continue_challenge(page):',
         '    selectors = ["input#continue",',
         '                 "xpath=/html/body/div/div[1]/div[3]/div/div/form/div/div/span"]',
@@ -310,9 +418,14 @@ def _write_worker_script(headless, locale, extra_headers):
         '    )',
         '    page = ctx.new_page()',
         '    page.add_init_script(_stealth_js)',
+        # Block heavy resources before navigating so they never hit the network.
+        # This is the single biggest speed-up for slow sites like Goodreads.
         '    page.route("**/*", _block_resources)',
         '    return ctx, page',
         '',
+        # ONE Firefox browser for the life of this worker process -- this is
+        # what keeps every fetch inside a single visible window instead of
+        # opening a fresh one per URL.
         'with sync_playwright() as pw:',
         '    browser = pw.firefox.launch(',
         '        headless=_headless,',
@@ -324,18 +437,43 @@ def _write_worker_script(headless, locale, extra_headers):
         '        try:',
         '            req = json.loads(line)',
         '            time.sleep(0.3 + random.random() * 0.5)',
+        # v6.2.33 ROOT-CAUSE FIX, carried into the persistent worker:
+        # wait_until="networkidle" used to raise TimeoutError, discarding
+        # the ENTIRE already-loaded page (zero content captured) whenever a
+        # site never goes fully network-silent. Amazon product pages
+        # routinely never satisfy networkidle even with the third-party
+        # ad/analytics blocklist above, because they keep making
+        # same-origin telemetry/personalization/live-pricing XHRs
+        # indefinitely. Two-stage approach instead: navigate waiting only
+        # for domcontentloaded (fast, reliable -- real page content is
+        # present by then), then give networkidle a SHORT best-effort
+        # window afterward for Cloudflare/bot-challenge JS redirects to
+        # settle, without throwing the whole fetch away if that window
+        # is not enough.
         '            try:',
-        '                page.goto(req["url"], wait_until="networkidle", timeout=int(req["timeout_ms"]))',
+        '                page.goto(req["url"], wait_until="domcontentloaded", timeout=int(req["timeout_ms"]))',
         '            except Exception:',
+        # A hard navigation failure (not just a networkidle timeout, which
+        # is handled separately below) may have left the page/context in a
+        # bad state -- recreate just the context/page, NOT a new browser
+        # process/window, and retry once.
         '                try:',
         '                    ctx.close()',
         '                except Exception:',
         '                    pass',
         '                ctx, page = _new_context(browser)',
-        '                page.goto(req["url"], wait_until="networkidle", timeout=int(req["timeout_ms"]))',
+        '                page.goto(req["url"], wait_until="domcontentloaded", timeout=int(req["timeout_ms"]))',
+        '            try:',
+        '                page.wait_for_load_state("networkidle", timeout=8000)',
+        '            except Exception:',
+        '                pass  # never went fully idle -- proceed with what loaded anyway',
         '            _handle_continue_challenge(page)',
+        # Extra breathing room after networkidle -- some SPAs fire late XHRs.
         '            page.wait_for_timeout(1500 + random.randint(0, 500))',
         '            html = page.content()',
+        # Safety net: if content is suspiciously small the challenge may
+        # still be resolving (e.g. a slow Cloudflare turnstile). Wait and
+        # re-sample.
         '            if len(html.encode("utf-8")) < 5000:',
         '                page.wait_for_timeout(4000 + random.randint(0, 1000))',
         '                html = page.content()',
@@ -395,7 +533,9 @@ def _stop_worker():
 
 
 def browser_close():
-    """Shut down the reusable browser worker, if one is running."""
+    """Shut down the reusable browser worker (and its Firefox window), if
+    one is running. Registered via atexit so it also runs on normal
+    interpreter shutdown."""
     _stop_worker()
 
 
