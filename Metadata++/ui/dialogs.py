@@ -1117,6 +1117,9 @@ class MetadataFetchDialog(QDialog):
     def _apply(self):
         from calibre_plugins.metadata_plus.ui.config import prefs  # type: ignore
         from calibre_plugins.metadata_plus.providers.providers import content_cover_quality  # type: ignore
+        from calibre_plugins.metadata_plus.core.book_stats import (  # type: ignore
+            get_word_count_from_epub, estimate_reading_time,
+            get_page_count, build_stats_header)
 
         applied = 0
         cover_kept = 0
@@ -1139,7 +1142,39 @@ class MetadataFetchDialog(QDialog):
                 if sel.get('title'):      mi.title     = sel['title']
                 if sel.get('authors'):    mi.authors   = list(sel['authors'])
                 if sel.get('publisher'):  mi.publisher = sel['publisher']
-                if sel.get('comments'):   mi.comments  = sel['comments']
+                if sel.get('comments'):
+                    comments = sel['comments']
+                    # v6.2.35: optional "Page Count / Word Count / Reading
+                    # Time / Tags -----" header, opt-in via prefs. Tags use
+                    # whatever is about to be saved this run if the user
+                    # fetched/selected new ones, else the book's existing
+                    # tags — either way, computed AFTER the user's final
+                    # selections, not at fetch time.
+                    if prefs.get('include_synopsis_stats_header', False):
+                        try:
+                            tags = list(sel['tags']) if sel.get('tags') else list(mi.tags or [])
+                            word_count = None
+                            try:
+                                fmts = self.db.formats(panel.book_id, index_is_id=True) or ''
+                                fmts = [f.strip().upper() for f in fmts.split(',') if f.strip()]
+                                if 'EPUB' in fmts:
+                                    epub_path = self.db.format_abspath(
+                                        panel.book_id, 'EPUB', index_is_id=True)
+                                    if epub_path:
+                                        word_count = get_word_count_from_epub(epub_path)
+                            except Exception:
+                                word_count = None
+                            reading_time = estimate_reading_time(word_count) if word_count else None
+                            page_count, page_is_est = get_page_count(mi, word_count=word_count)
+                            header = build_stats_header(
+                                page_count=page_count, page_is_estimate=page_is_est,
+                                word_count=word_count, reading_time=reading_time,
+                                tags=tags)
+                            if header:
+                                comments = header + '\n\n' + comments
+                        except Exception:
+                            pass  # never let header-building block saving the synopsis itself
+                    mi.comments = comments
                 if sel.get('tags'):       mi.tags      = list(sel['tags'])
                 if sel.get('language'):   mi.language  = sel['language']
                 if sel.get('rating'):

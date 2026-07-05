@@ -128,6 +128,7 @@ from calibre.utils.config import config_dir  # type: ignore
 
 from calibre_plugins.metadata_plus.ui.config import prefs  # type: ignore
 from calibre_plugins.metadata_plus.core.cache import MetadataCache  # type: ignore
+from calibre_plugins.metadata_plus.core.synopsis_cleaner import clean_synopsis  # type: ignore
 from calibre_plugins.metadata_plus.core.isbn_utils import normalize_isbn, repair_isbn, is_valid_isbn  # type: ignore
 from calibre_plugins.metadata_plus.core.fuzzy import (  # type: ignore
     normalize_language, normalize_publisher, normalize_pubdate,
@@ -685,11 +686,18 @@ def _merge_results(results, book_title, book_author, book_lang='',
 
         comments = r.get('comments', '')
         if comments and len(comments.strip()) >= 20:
+            # v6.2.35: repair HTML/whitespace formatting artifacts (unescaped
+            # &nbsp;, sentences glued together where a stripped paragraph
+            # break used to be, embedded press-quotes glued onto their
+            # attribution) BEFORE scoring/length checks below — see
+            # core/synopsis_cleaner.py for what this does and doesn't do
+            # (formatting repair only, never rewords/retranslates anything).
+            comments = clean_synopsis(comments.strip())
             # Store (text, weight, result_lang, source_name) — result_lang is
             # what the source reported for this specific result, not the
             # book's lang.
             result_lang = (r.get('language') or '').lower()[:2]
-            comment_candidates.append((comments.strip(), weight, result_lang, source_name))
+            comment_candidates.append((comments, weight, result_lang, source_name))
 
         for key in ('authors', 'publisher', 'pubdate',
                     'rating', 'language', 'identifiers'):
@@ -1229,13 +1237,18 @@ def fetch_for_book(db, book_id):
                                      book_lang=lang,
                                      probe_covers=False, log=None)
         if _pre_merged is None:
+            _before_browser_pass = len(results)
             _run_browser_pass(
                 active_sources, title, author, isbn, asin, lang,
                 results, lock, log,
             )
-            if results:
-                log.info('Browser pass collected %d result(s) for %r',
-                         len(results), title[:50])
+            _new_from_browser = len(results) - _before_browser_pass
+            if _new_from_browser > 0:
+                log.info('Browser pass collected %d new result(s) for %r',
+                         _new_from_browser, title[:50])
+            else:
+                log.info('Browser pass: no additional results found via '
+                         'browser fallback for %r', title[:50])
 
     # ── Step 4b: pick up ISBN the parallel fetch already found ─────────────
     if not isbn and not discovered_isbn:

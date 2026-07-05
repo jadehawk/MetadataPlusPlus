@@ -936,11 +936,44 @@ def has_white_border_padding(data, border_px=20, white_threshold=240, min_ratio=
 # changes the placeholder graphic (each process re-fetches its own
 # reference) and has no false-positive risk against real cover art.
 _google_placeholder_hash = None
+_google_placeholder_phash = None
 _google_placeholder_lock = None
 
 
+def _average_hash_bits(data, hash_size=16):
+    """
+    Compute a simple size-independent 'average hash' (aHash) of an image:
+    downsample to a small hash_size x hash_size grayscale canvas, then set
+    each bit based on whether that pixel is above/below the mean. Because
+    the image is normalized to a fixed small canvas first, two renders of
+    the SAME graphic at different original resolutions (e.g. Google Books'
+    placeholder served at 128x200 vs 1280x1670) hash identically or very
+    nearly so -- unlike a raw byte/SHA-256 hash, which differs for every
+    distinct resolution even when the visual content is identical.
+
+    Returns an int bitmask, or None if Pillow isn't available / decode fails.
+    """
+    try:
+        import io as _io
+        from PIL import Image as _PIL  # type: ignore
+        img = _PIL.open(_io.BytesIO(data)).convert('L').resize(
+            (hash_size, hash_size), _PIL.LANCZOS)
+        pixels = list(img.getdata())
+        avg = sum(pixels) / float(len(pixels))
+        bits = 0
+        for p in pixels:
+            bits = (bits << 1) | (1 if p > avg else 0)
+        return bits
+    except Exception:
+        return None
+
+
+def _hamming_distance(a, b):
+    return bin(a ^ b).count('1')
+
+
 def _get_google_placeholder_hash(timeout=8, log=None):
-    global _google_placeholder_hash, _google_placeholder_lock
+    global _google_placeholder_hash, _google_placeholder_phash, _google_placeholder_lock
     import threading
     if _google_placeholder_lock is None:
         _google_placeholder_lock = threading.Lock()
@@ -957,14 +990,25 @@ def _get_google_placeholder_hash(timeout=8, log=None):
             data = _http_get_bytes(bogus_url, timeout=timeout, log=log)
             if data and len(data) > 200:
                 _google_placeholder_hash = hashlib.sha256(data).hexdigest()
+                _google_placeholder_phash = _average_hash_bits(data)
                 if log:
                     log.debug('Google placeholder reference hash captured '
                               '(%d bytes)', len(data))
             else:
                 _google_placeholder_hash = ''
+                _google_placeholder_phash = None
         except Exception:
             _google_placeholder_hash = ''
+            _google_placeholder_phash = None
         return _google_placeholder_hash
+
+
+def _get_google_placeholder_phash(timeout=8, log=None):
+    # Ensures the reference (and its phash) have been captured, then
+    # returns the phash. Piggy-backs on the same cached fetch as the exact
+    # hash so this never triggers a second network call.
+    _get_google_placeholder_hash(timeout=timeout, log=log)
+    return _google_placeholder_phash
 
 
 def is_google_placeholder_cover(data, url='', timeout=8, log=None):
@@ -972,6 +1016,20 @@ def is_google_placeholder_cover(data, url='', timeout=8, log=None):
     True when `data` is confirmed to be Google Books' "image not available"
     placeholder graphic (see module comment above). Only meaningful for
     books.google.com cover URLs; harmless (always False) for anything else.
+
+    Two checks are tried:
+      1. Exact SHA-256 match against a reference fetch -- fast, zero false
+         positives, but only fires when the candidate happens to be the
+         same pixel dimensions as the reference.
+      2. A size-independent perceptual hash (aHash) comparison -- catches
+         the placeholder at ANY resolution, since Google renders the same
+         graphic scaled to whatever size was requested (field-confirmed:
+         a single book's cover candidates included the placeholder at
+         1280x1670, 1200x1565, and 575x750 -- three different sizes, none
+         of which matched a single fixed-size reference hash). A small
+         Hamming-distance threshold allows for minor resampling/JPEG noise
+         differences between resolutions while still requiring the images
+         to be near-identical in overall layout/content.
     """
     if not data or not url or 'books.google.com' not in url.lower():
         return False
@@ -979,9 +1037,65 @@ def is_google_placeholder_cover(data, url='', timeout=8, log=None):
         ref = _get_google_placeholder_hash(timeout=timeout, log=log)
         if not ref:
             return False
-        return hashlib.sha256(data).hexdigest() == ref
+        if hashlib.sha256(data).hexdigest() == ref:
+            return True
+        ref_phash = _get_google_placeholder_phash(timeout=timeout, log=log)
+        cand_phash = _average_hash_bits(data)
+        if ref_phash is not None and cand_phash is not None:
+            # 256-bit hash (16x16); allow a small amount of drift from
+            # resampling/compression differences across resolutions.
+            if _hamming_distance(ref_phash, cand_phash) <= 10:
+                return True
+        return False
     except Exception:
         return False
+
+
+def _edge_band_is_blank(gray_arr, from_edge, frac=0.32, flat_std_threshold=1.5,
+                         contrast_ratio=6.0):
+    """
+    True when a contiguous band covering `frac` of the image, taken from one
+    edge ('top', 'bottom', 'left', 'right'), is near-PERFECTLY flat AND the
+    rest of the image is meaningfully more varied than that.
+
+    Exists to catch a corruption pattern the whole-canvas checks in
+    is_blank_or_placeholder_image() miss: a partially-decoded or otherwise
+    broken cover fetch where (for example) the top ~65% renders real
+    illustration/typography correctly but the bottom ~35% is a flat white/
+    grey fill left over from the failed portion of the download. Whole-
+    canvas standard deviation looks fine (the healthy 65% dominates), and
+    has_white_border_padding() only samples a thin edge strip and requires
+    >= 2 padded edges, so a single large blank band at ONE edge slips past
+    both. Field-confirmed: a 128x185 Google Books cover candidate rendering
+    only its upper ~65% with a blank lower band.
+
+    IMPORTANT — false-positive guard: a genuinely minimalist cover design
+    can legitimately have a large flat-coloured region (e.g. a plain
+    background band behind the title). Flagging on absolute flatness alone
+    would misfire on those. So this requires BOTH:
+      1. The band itself is near-perfectly flat (std < flat_std_threshold,
+         a much stricter bar than "just fairly plain" — genuine printed/
+         photographed flat regions still carry some residual texture/
+         JPEG noise; a bare undecoded/placeholder fill typically doesn't).
+      2. The REST of the image is dramatically more varied than the band
+         (contrast_ratio×) — i.e. there's a stark discontinuity between
+         "real detail lives here" and "nothing lives here", rather than an
+         image that is just uniformly calm/minimalist throughout.
+    """
+    h, w = gray_arr.shape
+    if from_edge == 'top':
+        n = max(1, int(h * frac)); band = gray_arr[:n, :]; rest = gray_arr[n:, :]
+    elif from_edge == 'bottom':
+        n = max(1, int(h * frac)); band = gray_arr[-n:, :]; rest = gray_arr[:-n, :]
+    elif from_edge == 'left':
+        n = max(1, int(w * frac)); band = gray_arr[:, :n]; rest = gray_arr[:, n:]
+    else:
+        n = max(1, int(w * frac)); band = gray_arr[:, -n:]; rest = gray_arr[:, :-n]
+    band_std = float(band.std())
+    if band_std >= flat_std_threshold:
+        return False
+    rest_std = float(rest.std())
+    return rest_std > flat_std_threshold * contrast_ratio
 
 
 def is_blank_or_placeholder_image(data, std_threshold=10.0, min_unique_colours=6,
@@ -1006,13 +1120,40 @@ def is_blank_or_placeholder_image(data, std_threshold=10.0, min_unique_colours=6
     "truthfulness" problem: a bigger blank image is not a better cover.
 
     Detection: downsample to a small 32x32 thumbnail (fast, robust to
-    JPEG noise) and check both:
+    JPEG noise) and check:
       1. Overall pixel value standard deviation — real cover art has
          strong contrast/detail even at 32x32; flat or near-flat images
          don't.
       2. Number of visually distinct colours (coarse-bucketed to 4 bits
          per channel) — a handful of buckets means large flat regions.
-    Either signal alone flags the image as blank/placeholder.
+      3. Compression efficiency (bytes/pixel) — flat placeholder graphics
+         compress far more efficiently than real photographed/illustrated
+         art.
+      4. A large, near-PERFECTLY-flat band at one edge (top/bottom/left/
+         right), on a separate 64x64 grid — catches partially-decoded or
+         otherwise broken fetches where most of the canvas is real
+         content but a big contiguous chunk near one edge is a flat
+         leftover fill (see _edge_band_is_blank()'s docstring). Deliberately
+         requires near-zero variance (not just "fairly plain"), because
+         testing showed a genuinely blank/undecoded fill reads as almost
+         exactly 0.0 std, while even an intentionally flat-coloured real
+         design consistently shows some texture/JPEG noise (~2+) — so this
+         threshold is set to exploit that gap without flagging legitimate
+         minimalist cover designs.
+    Any signal alone flags the image as blank/placeholder.
+
+    NOTE ON A KNOWN REMAINING GAP: a low-contrast "no cover available" CDN
+    placeholder (flat background + a couple of soft rectangular text-bars +
+    a small icon, all in muted greys) can sometimes have just enough tonal
+    variety to survive every check above. An edge/gradient-density signal
+    was tried for this and DROPPED after testing showed it doesn't reliably
+    separate that case from genuinely minimalist real cover art (both
+    landed in a similar, overlapping range) — shipping it would trade
+    "misses a placeholder" for "flags real covers", which is worse. If a
+    specific recurring placeholder source is identified (the way Google
+    Books' one was, via is_google_placeholder_cover()), a reference-hash
+    fingerprint is the more reliable fix; a general pixel heuristic isn't
+    a safe way to solve it.
 
     Requires Pillow + numpy (bundled with Calibre). Returns False safely
     on any error, and treats undecodable/too-tiny images as blank too
@@ -1060,6 +1201,19 @@ def is_blank_or_placeholder_image(data, std_threshold=10.0, min_unique_colours=6
         bytes_per_pixel = len(data) / float(w * h)
         if bytes_per_pixel < 0.03:
             return True
+
+        # v6.2.35: FOURTH signal — a large blank band at one edge, on a
+        # slightly higher-resolution 64x64 grayscale grid (fine enough to
+        # resolve a ~30% band reliably; the 32x32 thumb above is enough
+        # for whole-canvas stats but too coarse for this). Whole-canvas
+        # std/colour-count/compression checks above can all look healthy
+        # when only part of the canvas is broken — see
+        # _edge_band_is_blank()'s docstring for the field-confirmed case
+        # this catches (a truncated Google Books cover fetch).
+        gray64 = _np.array(img.convert('L').resize((64, 64))).astype(_np.float32)
+        for edge in ('top', 'bottom', 'left', 'right'):
+            if _edge_band_is_blank(gray64, edge):
+                return True
 
         return False
     except Exception:
@@ -1633,6 +1787,26 @@ def _parse_ol_book(info, isbn):
 
 
 # ── Goodreads ──────────────────────────────────────────────────────────────────
+# KNOWN BUG (fixed here): when a Goodreads book page has no synopsis text in
+# its embedded JSON payload (common for freshly-synced self-published titles
+# that only got a title+cover import, not a description), the code fell back
+# to the page's <meta name="description"> tag. But when THAT is also empty,
+# Goodreads serves its generic site-wide tagline instead of nothing:
+# "Discover and share books you love on Goodreads." — 49 chars, long enough
+# to pass the `len >= 20` sanity check, so it was accepted as if it were a
+# real book-specific synopsis. Explicitly reject this known boilerplate string
+# (and close variants) so a book with no real Goodreads synopsis correctly
+# contributes no 'comments' field at all, instead of polluting the merge /
+# "Choose Description" picker with Goodreads' marketing copy.
+_GOODREADS_BOILERPLATE_DESCRIPTIONS = {
+    'discover and share books you love on goodreads.',
+    'discover and share books you love on goodreads',
+}
+
+
+def _is_goodreads_boilerplate(text):
+    return text.strip().lower() in _GOODREADS_BOILERPLATE_DESCRIPTIONS
+
 # Goodreads retired its public Developer API in Dec 2020, so this scrapes the
 # public-facing site: a search page resolves title/author/isbn to a
 # /book/show/<id> URL, then the book page itself supplies title, author,
@@ -1837,8 +2011,10 @@ def fetch_goodreads(title, author, isbn, asin='', lang='', timeout=20, retries=2
         if len(cand) > len(best_desc):
             best_desc = cand
     if not best_desc and og.get('comments'):
-        best_desc = _clean_goodreads_description(og['comments'])
-    if best_desc and len(best_desc) >= 20:
+        candidate = _clean_goodreads_description(og['comments'])
+        if not _is_goodreads_boilerplate(candidate):
+            best_desc = candidate
+    if best_desc and len(best_desc) >= 20 and not _is_goodreads_boilerplate(best_desc):
         result['comments'] = best_desc
 
     rm = re.search(r'"averageRating"\s*:\s*"?([\d.]+)"?', page)

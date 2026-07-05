@@ -378,6 +378,12 @@ _STRINGS = {
         'es': 'Detectar duplicados tras la obtención',
         'ro': 'Detectează duplicatele după preluare',
     },
+    'cb_synopsis_header': {
+        'en': 'Prepend page/word count, reading time & tags to synopsis',
+        'it': 'Antepone numero pagine/parole, tempo di lettura e tag alla trama',
+        'es': 'Anteponer nº de páginas/palabras, tiempo de lectura y etiquetas a la sinopsis',
+        'ro': 'Adaugă la început nr. de pagini/cuvinte, timp de citire și etichete la sinopsis',
+    },
     'lbl_fuzzy_threshold': {
         'en': 'Fuzzy match threshold:', 'it': 'Soglia di corrispondenza approssimata:',
         'es': 'Umbral de coincidencia difusa:', 'ro': 'Prag de potrivire aproximativă:',
